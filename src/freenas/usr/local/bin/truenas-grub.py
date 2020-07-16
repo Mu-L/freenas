@@ -11,29 +11,35 @@ def dict_factory(cursor, row):
     return d
 
 
-if __name__ == "__main__":
+def retrieve_grub_config():
+    config = {
+        'GRUB_DISTRIBUTOR': ['TrueNAS Scale'],
+        'GRUB_CMDLINE_LINUX_DEFAULT': [],
+        'GRUB_TERMINAL': ['console'],
+        'GRUB_CMDLINE_LINUX': []
+    }
     conn = sqlite3.connect(FREENAS_DATABASE)
     conn.row_factory = dict_factory
     c = conn.cursor()
     c.execute("SELECT * FROM system_advanced")
-    advanced = {k.replace("adv_", ""): v for k, v in c.fetchone().items()}
+    advanced = {k.replace('adv_', ''): v for k, v in c.fetchone().items()}
+    if advanced['serialconsole']:
+        config['GRUB_SERIAL_COMMAND'] = [
+            'serial', f'--speed={advanced["serialspeed"]}', '--word=8', '--parity=no', '--stop=1'
+        ]
+        config['GRUB_TERMINAL'].append('serial')
+        config['GRUB_CMDLINE_LINUX'].extend([
+            f'console={advanced["serialport"]},{advanced["serialspeed"]}',  'console=tty1'
+        ])
+    return config
 
-    config = [
-        'GRUB_DISTRIBUTOR="TrueNAS Scale"',
-        'GRUB_CMDLINE_LINUX_DEFAULT=""',
-    ]
 
-    terminal = ["console"]
-    cmdline = []
-    if advanced["serialconsole"]:
-        config.append(f'GRUB_SERIAL_COMMAND="serial --speed={advanced["serialspeed"]} --word=8 --parity=no --stop=1"')
-        terminal.append("serial")
+def convert_config_to_file(config):
+    return '\n'.join([
+        f'{k}="{" ".join(v)}"' for k, v in config.items()
+    ])
 
-        cmdline.append(f"console={advanced['serialport']},{advanced['serialspeed']} console=tty1")
 
-    config.append(f'GRUB_TERMINAL="{" ".join(terminal)}"')
-    config.append(f'GRUB_CMDLINE_LINUX="{" ".join(cmdline)}"')
-    config.append("")
-
-    with open("/etc/default/grub.d/truenas.cfg", 'w') as f:
-        f.write("\n".join(config))
+if __name__ == '__main__':
+    with open('/etc/default/grub.d/truenas.cfg', 'w') as f:
+        f.write(convert_config_to_file(retrieve_grub_config()))
