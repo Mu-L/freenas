@@ -317,6 +317,7 @@ class SystemAdvancedService(ConfigService):
                 # kdump changes require a reboot to take effect. So just generating the kdump config
                 # should be enough
                 await self.middleware.call('etc.generate', 'kdump')
+                await self.middleware.call('etc.generate', 'grub')
 
         return await self.config()
 

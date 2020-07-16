@@ -29,17 +29,19 @@ def retrieve_grub_config():
         ]
         config['GRUB_TERMINAL'].append('serial')
         config['GRUB_CMDLINE_LINUX'].extend([
-            f'console={advanced["serialport"]},{advanced["serialspeed"]}',  'console=tty1'
+            f'console={advanced["serialport"]},{advanced["serialspeed"]}', 'console=tty1'
         ])
     return config
 
 
 def convert_config_to_file(config):
-    return '\n'.join([
-        f'{k}="{" ".join(v)}"' for k, v in config.items()
-    ])
+    return '\n'.join([f'{k}="{" ".join(v)}"' for k, v in config.items()])
+
+
+def update_truenas_cfg(config):
+    with open('/etc/default/grub.d/truenas.cfg', 'w') as f:
+        f.write(convert_config_to_file(config))
 
 
 if __name__ == '__main__':
-    with open('/etc/default/grub.d/truenas.cfg', 'w') as f:
-        f.write(convert_config_to_file(retrieve_grub_config()))
+    update_truenas_cfg(retrieve_grub_config())
