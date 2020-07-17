@@ -20,7 +20,7 @@ sys_pool=$(${FREENAS_SQLITE_CMD} ${FREENAS_CONFIG} "
     FROM
         system_systemdataset
     ORDER BY
-		    -id
+        -id
     LIMIT 1
   ")
 
