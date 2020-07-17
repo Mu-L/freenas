@@ -1729,6 +1729,14 @@ class InterfaceService(CRUDService):
             members = await self.middleware.call('datastore.query', 'network.lagginterfacemembers',
                                                  [('lagg_interfacegroup_id', '=', lagg['id'])],
                                                  {'order_by': ['lagg_physnic']})
+
+            # We have to add the physical nics that make up the lagg
+            # or we will unnecessarily bring down those interfaces
+            # when this method is called
+            for i in members:
+                if i['lagg_physnic'] not in interfaces:
+                    interfaces.append(i['lagg_physnic'])
+
             disable_capabilities = name in disable_capabilities_ifaces
 
             cloned_interfaces.append(name)
@@ -1821,6 +1829,14 @@ class InterfaceService(CRUDService):
     @private
     async def sync_interface(self, name, wait_dhcp=False, options=None):
         options = options or {}
+
+        # If the `name` is a phys interface and is a member of a lagg, then
+        # there is no reason to configure it since it's already configured
+        # during lagg creation
+        lagg_members = await self.middleware.call('datastore.query', 'network.lagginterfacemembers')
+        for i in lagg_members:
+            if name in i['lagg_physnic']:
+                return
 
         try:
             data = await self.middleware.call('datastore.query', 'network.interfaces', [('int_interface', '=', name)], {'get': True})
