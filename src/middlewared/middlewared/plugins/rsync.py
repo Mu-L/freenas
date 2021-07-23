@@ -33,7 +33,7 @@ import os
 import shlex
 
 from middlewared.common.attachment import LockableFSAttachmentDelegate
-from middlewared.schema import accepts, Bool, Cron, Dict, Str, Int, List, Patch
+from middlewared.schema import accepts, Bool, Cron, Dict, Str, Int, List, Patch, returns
 from middlewared.validators import Range, Match
 from middlewared.service import (
     CallError, SystemServiceService, ValidationErrors, job, item_method, private, SharingService, TaskPathService,
@@ -95,12 +95,13 @@ class RsyncdService(SystemServiceService):
         datastore_prefix = "rsyncd_"
         cli_namespace = 'service.rsync'
 
-    @accepts(Dict(
-        'rsyncd_update',
-        Int('port', validators=[Range(min=1, max=65535)]),
-        Str('auxiliary', max_length=None),
-        update=True
-    ))
+    ENTRY = Dict(
+        'rsyncd_entry',
+        Int('port', required=True, validators=[Range(min=1, max=65535)]),
+        Int('id', required=True),
+        Str('auxiliary', required=True, max_length=None),
+    )
+
     async def do_update(self, data):
         """
         Update Rsyncd Service Configuration.
@@ -144,6 +145,12 @@ class RsyncModService(SharingService):
         datastore_extend = 'rsyncmod.rsync_mod_extend'
         cli_namespace = 'service.rsync_mod'
 
+    ENTRY = Patch(
+        'rsyncmod_create', 'rsyncmod_entry',
+        ('add', Bool('locked')),
+        ('add', Int('id')),
+    )
+
     @private
     async def rsync_mod_extend(self, data):
         data['hostsallow'] = data['hostsallow'].split()
@@ -181,7 +188,7 @@ class RsyncModService(SharingService):
         Str('name', validators=[Match(r'[^/\]]')]),
         Str('comment'),
         Str('path', required=True, max_length=RSYNC_PATH_LIMIT),
-        Str('mode', enum=['RO', 'RW', 'WO']),
+        Str('mode', enum=['RO', 'RW', 'WO'], required=True),
         Int('maxconn'),
         Str('user', default='nobody'),
         Str('group', default='nobody'),
@@ -247,7 +254,6 @@ class RsyncModService(SharingService):
 
         return await self.get_instance(id)
 
-    @accepts(Int('id'))
     async def do_delete(self, id):
         """
         Delete Rsyncmod module of `id`.
@@ -297,9 +303,23 @@ class RsyncTaskService(TaskPathService):
         datastore_extend_context = 'rsynctask.rsync_task_extend_context'
         cli_namespace = 'task.rsync'
 
+    ENTRY = Patch(
+        'rsync_task_create', 'rsync_task_entry',
+        ('rm', {'name': 'validate_rpath'}),
+        ('add', Int('id')),
+        ('add', Bool('locked')),
+        ('add', Dict('job', null=True, additional_attrs=True)),
+    )
+
     @private
     async def rsync_task_extend(self, data, context):
-        data['extra'] = shlex.split(data['extra'].replace('"', r'"\"').replace("'", r'"\"'))
+        try:
+            data['extra'] = shlex.split(data['extra'].replace('"', r'"\"').replace("'", r'"\"'))
+        except ValueError:
+            # This is to handle the case where the extra value is misconfigured for old cases
+            # Moving on, we are going to verify that it can be split successfully using shlex
+            data['extra'] = data['extra'].split()
+
         for field in ('mode', 'direction'):
             data[field] = data[field].upper()
         Cron.convert_db_format_to_schedule(data)
@@ -351,10 +371,11 @@ class RsyncTaskService(TaskPathService):
         if not remote_host:
             verrors.add(f'{schema}.remotehost', 'Please specify a remote host')
 
-        if data.get('extra'):
-            data['extra'] = ' '.join(data['extra'])
-        else:
-            data['extra'] = ''
+        data['extra'] = ' '.join(data['extra'])
+        try:
+            shlex.split(data['extra'].replace('"', r'"\"').replace("'", r'"\"'))
+        except ValueError as e:
+            verrors.add(f'{schema}.extra', f'Please specify valid value: {e}')
 
         mode = data.get('mode')
         if not mode:
@@ -612,7 +633,6 @@ class RsyncTaskService(TaskPathService):
 
         return await self.get_instance(id)
 
-    @accepts(Int('id'))
     async def do_delete(self, id):
         """
         Delete Rsync Task of `id`.
@@ -674,6 +694,7 @@ class RsyncTaskService(TaskPathService):
 
     @item_method
     @accepts(Int('id'))
+    @returns()
     @job(lock=lambda args: args[-1], lock_queue_size=1, logs=True)
     def run(self, job, id):
         """

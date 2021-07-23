@@ -1,12 +1,12 @@
-import asyncio
 import ipaddress
 import subprocess
 import time
 
 from middlewared.plugins.interface.netif import netif
-from middlewared.service import CallError, ConfigService
+from middlewared.service import ConfigService
 
 from .k8s import api_client, service_accounts
+from .utils import KUBEROUTER_RULE_PRIORITY, KUBEROUTER_TABLE_ID, KUBEROUTER_TABLE_NAME
 
 
 class KubernetesCNIService(ConfigService):
@@ -36,20 +36,18 @@ class KubernetesCNIService(ConfigService):
             'datastore.update', 'services.kubernetes', kube_config['id'], {'cni_config': cni_config}
         )
         await self.middleware.call('etc.generate', 'cni')
+
+        # Let's create kube-router routing table
+        route_table = netif.RouteTable(KUBEROUTER_TABLE_ID, KUBEROUTER_TABLE_NAME)
+        if not route_table.exists:
+            route_table.create()
+        # We will add a rule now to forward pod traffic to the kube-router table
+        # so that user can make use of policy based routing
+        rule_table = netif.RuleTable()
+        if not rule_table.rule_exists(KUBEROUTER_RULE_PRIORITY):
+            rule_table.add_rule(KUBEROUTER_TABLE_ID, KUBEROUTER_RULE_PRIORITY, kube_config['cluster_cidr'])
+
         await self.middleware.call('service.start', 'kuberouter')
-
-        rt = netif.RoutingTable()
-        timeout = 60
-        while timeout > 0:
-            if 'kube-router' not in rt.routing_tables:
-                await asyncio.sleep(2)
-                timeout -= 2
-            else:
-                break
-
-        if 'kube-router' not in rt.routing_tables:
-            raise CallError('Unable to locate kube-router routing table. Please refer to kuberouter logs.')
-
         await self.middleware.call('k8s.cni.add_user_route_to_kube_router_table')
 
     async def validate_cni_integrity(self, cni, config=None):
@@ -107,7 +105,7 @@ class KubernetesCNIService(ConfigService):
             return
 
         rt = netif.RoutingTable()
-        kube_router_table = rt.routing_tables['kube-router']
+        kube_router_table = rt.routing_tables[KUBEROUTER_TABLE_NAME]
         for k in filter(lambda k: config[f'{k}_gateway'] and config[f'{k}_interface'], ('route_v4', 'route_v6')):
             factory = ipaddress.IPv4Address if k.endswith('v4') else ipaddress.IPv6Address
             rt.add(netif.Route(
@@ -122,7 +120,14 @@ class KubernetesCNIService(ConfigService):
         cp = subprocess.Popen(['kube-router', '--cleanup-config'], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         stderr = cp.communicate()[1]
         if cp.returncode:
-            raise CallError(f'Failed to cleanup kube-router configuration: {stderr.decode()}')
+            # Let's log the error as to why kube-router was not able to clean up ipvs bits
+            # TODO: We should raise an exception but right now this is broken upstream and raising an exception
+            #  here means we won't be cleaning/flushing the locally configured routes adding to the issue
+            self.logger.error('Failed to cleanup kube-router configuration: %r', stderr.decode())
+
+        rule_table = netif.RuleTable()
+        if rule_table.rule_exists(KUBEROUTER_RULE_PRIORITY):
+            rule_table.delete_rule(KUBEROUTER_RULE_PRIORITY)
 
         tables = netif.RoutingTable().routing_tables
         for t_name in filter(lambda t: t in tables, ('kube-router', 'kube-router-dsr')):

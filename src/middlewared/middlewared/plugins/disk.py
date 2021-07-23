@@ -14,7 +14,7 @@ except ImportError:
     get_nsid = None
 
 from middlewared.common.camcontrol import camcontrol_list
-from middlewared.schema import accepts, Bool, Dict, Int, Str
+from middlewared.schema import accepts, Bool, Datetime, Dict, Int, List, Patch, Ref, returns, Str
 from middlewared.service import filterable, private, CallError, CRUDService
 from middlewared.service_exception import ValidationErrors
 import middlewared.sqlalchemy as sa
@@ -44,7 +44,6 @@ class DiskModel(sa.Model):
     disk_hddstandby = sa.Column(sa.String(120), default="Always On")
     disk_hddstandby_force = sa.Column(sa.Boolean(), default=False)
     disk_advpowermgmt = sa.Column(sa.String(120), default="Disabled")
-    disk_acousticlevel = sa.Column(sa.String(120), default="Disabled")
     disk_togglesmart = sa.Column(sa.Boolean(), default=True)
     disk_smartoptions = sa.Column(sa.String(120))
     disk_expiretime = sa.Column(sa.DateTime(), nullable=True)
@@ -73,6 +72,47 @@ class DiskService(CRUDService):
         event_send = False
         cli_namespace = 'storage.disk'
 
+    ENTRY = Dict(
+        'disk_entry',
+        Str('identifier', required=True),
+        Str('name', required=True),
+        Str('subsystem', required=True),
+        Int('number', required=True),
+        Str('serial', required=True),
+        Int('size', required=True),
+        Str('multipath_name', required=True),
+        Str('multipath_member', required=True),
+        Str('description', required=True),
+        Str('transfermode', required=True),
+        Str(
+            'hddstandby', required=True, enum=[
+                'ALWAYS ON', '5', '10', '20', '30', '60', '120', '180', '240', '300', '330'
+            ]
+        ),
+        Bool('hddstandby_force', required=True),
+        Bool('togglesmart', required=True),
+        Str('advpowermgmt', required=True, enum=['DISABLED', '1', '64', '127', '128', '192', '254']),
+        Str('smartoptions', required=True),
+        Datetime('expiretime', required=True, null=True),
+        Int('critical', required=True, null=True),
+        Int('difference', required=True, null=True),
+        Int('informational', required=True, null=True),
+        Str('model', required=True, null=True),
+        Int('rotationrate', required=True, null=True),
+        Str('type', required=True, null=True),
+        Str('zfs_guid', required=True, null=True),
+        Str('devname', required=True),
+        Dict(
+            'enclosure',
+            Int('number'),
+            Int('slot'),
+            null=True, required=True
+        ),
+        Str('pool', null=True, required=True),
+        Str('passwd', private=True),
+        Str('kmip_uid', null=True),
+    )
+
     @filterable
     async def query(self, filters, options):
         """
@@ -94,7 +134,7 @@ class DiskService(CRUDService):
     @private
     async def disk_extend(self, disk, context):
         disk.pop('enabled', None)
-        for key in ['acousticlevel', 'advpowermgmt', 'hddstandby']:
+        for key in ['advpowermgmt', 'hddstandby']:
             disk[key] = disk[key].upper()
         try:
             disk['size'] = int(disk['size'])
@@ -163,32 +203,24 @@ class DiskService(CRUDService):
 
     @accepts(
         Str('id'),
-        Dict(
-            'disk_update',
-            Bool('togglesmart'),
-            Str('acousticlevel', enum=[
-                'DISABLED', 'MINIMUM', 'MEDIUM', 'MAXIMUM'
-            ]),
-            Str('advpowermgmt', enum=[
-                'DISABLED', '1', '64', '127', '128', '192', '254'
-            ]),
-            Str('description'),
-            Str('hddstandby', enum=[
-                'ALWAYS ON', '5', '10', '20', '30', '60', '120', '180', '240', '300', '330'
-            ]),
-            Bool('hddstandby_force'),
-            Str('passwd', private=True),
-            Str('smartoptions'),
-            Int('critical', null=True),
-            Int('difference', null=True),
-            Int('informational', null=True),
-            Dict(
-                'enclosure',
-                Int('number'),
-                Int('slot'),
-                null=True,
-            ),
-            update=True
+        Patch(
+            'disk_entry', 'disk_update',
+            ('rm', {'name': 'identifier'}),
+            ('rm', {'name': 'name'}),
+            ('rm', {'name': 'subsystem'}),
+            ('rm', {'name': 'serial'}),
+            ('rm', {'name': 'kmip_uid'}),
+            ('rm', {'name': 'size'}),
+            ('rm', {'name': 'multipath_name'}),
+            ('rm', {'name': 'multipath_member'}),
+            ('rm', {'name': 'transfermode'}),
+            ('rm', {'name': 'expiretime'}),
+            ('rm', {'name': 'model'}),
+            ('rm', {'name': 'rotationrate'}),
+            ('rm', {'name': 'type'}),
+            ('rm', {'name': 'zfs_guid'}),
+            ('rm', {'name': 'devname'}),
+            ('attr', {'update': True}),
         )
     )
     async def do_update(self, id, data):
@@ -237,7 +269,7 @@ class DiskService(CRUDService):
                 asyncio.ensure_future(self.middleware.call('kmip.reset_sed_disk_password', id, new['kmip_uid']))
             new['kmip_uid'] = None
 
-        for key in ['acousticlevel', 'advpowermgmt', 'hddstandby']:
+        for key in ['advpowermgmt', 'hddstandby']:
             new[key] = new[key].title()
 
         self._compress_enclosure(new)
@@ -250,7 +282,7 @@ class DiskService(CRUDService):
             {'prefix': self._config.datastore_prefix}
         )
 
-        if any(new[key] != old[key] for key in ['hddstandby', 'advpowermgmt', 'acousticlevel']):
+        if any(new[key] != old[key] for key in ['hddstandby', 'advpowermgmt']):
             await self.middleware.call('disk.power_management', new['name'])
 
         if any(
@@ -280,7 +312,7 @@ class DiskService(CRUDService):
     async def copy_settings(self, old, new):
         await self.middleware.call('disk.update', new['identifier'], {
             k: v for k, v in old.items() if k in [
-                'togglesmart', 'acousticlevel', 'advpowermgmt', 'description', 'hddstandby', 'hddstandby_force',
+                'togglesmart', 'advpowermgmt', 'description', 'hddstandby', 'hddstandby_force',
                 'smartoptions', 'critical', 'difference', 'informational',
             ]
         })
@@ -310,6 +342,7 @@ class DiskService(CRUDService):
             return disk["name"]
 
     @accepts(Bool("join_partitions", default=False))
+    @returns(List('unused_disks', items=[Ref('disk_entry')]))
     async def get_unused(self, join_partitions):
         """
         Helper method to get all disks that are not in use, either by the boot
@@ -326,7 +359,7 @@ class DiskService(CRUDService):
     @private
     async def get_reserved(self):
         reserved = list(await self.middleware.call('boot.get_disks'))
-        reserved += [i async for i in await self.middleware.call('pool.get_disks')]
+        reserved += await self.middleware.call('pool.get_disks')
         if osc.IS_FREEBSD:
             # FIXME: Make this freebsd specific for now
             reserved += [i async for i in self.__get_iscsi_targets()]
@@ -348,6 +381,13 @@ class DiskService(CRUDService):
 
     @private
     async def sed_unlock_all(self):
+        # on an HA system, if both controllers manage to send
+        # SED commands at the same time, then it can cause issues
+        # where, ultimately, the disks don't get unlocked
+        if await self.middleware.call('failover.licensed'):
+            if await self.middleware.call('failover.status') == 'BACKUP':
+                return
+
         advconfig = await self.middleware.call('system.advanced.config')
         disks = await self.middleware.call('disk.query', [], {'extra': {'passwords': True}})
 
@@ -367,6 +407,13 @@ class DiskService(CRUDService):
 
     @private
     async def sed_unlock(self, disk_name, disk=None, _advconfig=None):
+        # on an HA system, if both controllers manage to send
+        # SED commands at the same time, then it can cause issues
+        # where, ultimately, the disks don't get unlocked
+        if await self.middleware.call('failover.licensed'):
+            if await self.middleware.call('failover.status') == 'BACKUP':
+                return
+
         if _advconfig is None:
             _advconfig = await self.middleware.call('system.advanced.config')
 
@@ -436,6 +483,13 @@ class DiskService(CRUDService):
         SETUP_FAILED - Initial setup call failed
         SUCCESS - Setup successfully completed
         """
+        # on an HA system, if both controllers manage to send
+        # SED commands at the same time, then it can cause issues
+        # where, ultimately, the disks don't get unlocked
+        if await self.middleware.call('failover.licensed'):
+            if await self.middleware.call('failover.status') == 'BACKUP':
+                return
+
         devname = await self.middleware.call('disk.sed_dev_name', disk_name)
 
         cp = await run('sedutil-cli', '--isValidSED', devname, check=False)
@@ -631,7 +685,10 @@ class DiskService(CRUDService):
                     await self.middleware.call('datastore.update', 'storage.disk', diskobj['disk_identifier'], diskobj)
 
         # Update all disks which were not identified as MULTIPATH, resetting attributes
-        for disk in (await self.middleware.call('datastore.query', 'storage.disk', [('disk_identifier', 'nin', mp_ids)])):
+        disks = await self.middleware.call(
+            'datastore.query', 'storage.disk', [('disk_identifier', 'nin', mp_ids)]
+        )
+        for disk in disks:
             if disk['disk_multipath_name'] or disk['disk_multipath_member']:
                 disk['disk_multipath_name'] = ''
                 disk['disk_multipath_member'] = ''
@@ -674,7 +731,7 @@ class DiskService(CRUDService):
     async def configure_power_management(self):
         """
         This runs on boot to properly configure all power management options
-        (Advanced Power Management, Automatic Acoustic Management and IDLE) for all disks.
+        (Advanced Power Management and IDLE) for all disks.
         """
         # Do not run power management on ENTERPRISE
         if await self.middleware.call('system.product_type') == 'ENTERPRISE':

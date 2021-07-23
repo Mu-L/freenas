@@ -11,8 +11,7 @@ import urllib.parse
 
 from middlewared.client import Client
 from middlewared.service_exception import CallError
-from middlewared.schema import (Bool, Dict, Int, Patch, Str,
-                                ValidationErrors, accepts)
+from middlewared.schema import accepts, Bool, Dict, Int, List, Patch, Ref, returns, Str, ValidationErrors
 from middlewared.service import CRUDService, private
 import middlewared.sqlalchemy as sa
 from middlewared.utils import run
@@ -243,6 +242,11 @@ class KeychainCredentialService(CRUDService):
         datastore = "system.keychaincredential"
         cli_namespace = "system.keychain_credential"
 
+    ENTRY = Patch(
+        "keychain_credential_create", "keychain_credential_entry",
+        ("add", Int("id")),
+    )
+
     @accepts(Dict(
         "keychain_credential_create",
         Str("name", required=True),
@@ -362,6 +366,7 @@ class KeychainCredentialService(CRUDService):
         return new
 
     @accepts(Int("id"), Dict("options", Bool("cascade", default=False)))
+    @returns()
     async def do_delete(self, id, options):
         """
         Delete Keychain Credential with specific `id`
@@ -396,6 +401,11 @@ class KeychainCredentialService(CRUDService):
         )
 
     @accepts(Int("id"))
+    @returns(List("credential_results", items=[Dict(
+        "credential_result",
+        Str("title"),
+        Str("unbind_method"),
+    )]))
     async def used_by(self, id):
         """
         Returns list of objects that use this credential.
@@ -438,6 +448,7 @@ class KeychainCredentialService(CRUDService):
 
     @private
     @accepts(Int("id"), Str("type"))
+    @returns(Ref("keychain_credential_entry"))
     async def get_of_type(self, id, type):
         try:
             credential = await self.middleware.call("keychaincredential.query", [["id", "=", id]], {"get": True})
@@ -453,6 +464,11 @@ class KeychainCredentialService(CRUDService):
             return credential
 
     @accepts()
+    @returns(Dict(
+        "ssh_key_pair",
+        Str("private_key", max_length=None, required=True),
+        Str("public_key", max_length=None, required=True),
+    ))
     def generate_ssh_key_pair(self):
         """
         Generate a public/private key pair
@@ -498,6 +514,7 @@ class KeychainCredentialService(CRUDService):
         Str("port", default=22),
         Int("connect_timeout", default=10),
     ))
+    @returns(Str("remove_ssh_host_key", max_length=None))
     async def remote_ssh_host_key_scan(self, data):
         """
         Discover a remote host key
@@ -543,6 +560,7 @@ class KeychainCredentialService(CRUDService):
         Str("cipher", enum=["STANDARD", "FAST", "DISABLED"], default="STANDARD"),
         Int("connect_timeout", default=10),
     ))
+    @returns(Ref("keychain_credential_entry"))
     def remote_ssh_semiautomatic_setup(self, data):
         """
         Perform semi-automatic SSH connection setup with other FreeNAS machine
@@ -634,6 +652,8 @@ class KeychainCredentialService(CRUDService):
         # Make sure SSH is enabled
         if not service["enable"]:
             await self.middleware.call("service.update", "ssh", {"enable": True})
+
+        if service["state"] != "RUNNING":
             await self.middleware.call("service.start", "ssh")
 
             # This might be the first time of the service being enabled

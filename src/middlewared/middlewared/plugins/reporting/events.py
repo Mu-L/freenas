@@ -1,6 +1,5 @@
 from collections import defaultdict
 import glob
-import itertools
 import json
 import psutil
 import re
@@ -166,12 +165,10 @@ class RealtimeEventSource(EventSource):
             'time': time.monotonic(),
             'speeds': self.get_interface_speeds(),
         }
-        if osc.IS_LINUX:
-            disk_stats = DiskStats()
+        disk_stats = DiskStats()
 
         while not self._cancel_sync.is_set():
             data = {}
-
 
             # ZFS ARC Size (raw value is in Bytes)
             hits = 0
@@ -304,13 +301,10 @@ class RealtimeEventSource(EventSource):
                         'stats_time': stats_time,
                     }
 
-            if osc.IS_LINUX:
-                data['disks'] = disk_stats.get()
+            data['disks'] = disk_stats.get()
 
             self.send_event('ADDED', fields=data)
             time.sleep(2)
-
-    AMD_CORE_COUNT = None
 
     def _cpu_temperature(self):
         temperature = {}
@@ -324,36 +318,7 @@ class RealtimeEventSource(EventSource):
         else:
             amd_sensor = sensors.get('k10temp-pci-00c3')
             if amd_sensor:
-                # AMD CPU
-                if self.AMD_CORE_COUNT is None:
-                    self.AMD_CORE_COUNT = len([
-                        line
-                        for line in subprocess.run(
-                            ['lscpu', '-p=core'], capture_output=True, text=True,
-                        ).stdout.split('\n')
-                        if line.isdigit()
-                    ])
-
-                ccds = []
-                for k, v in amd_sensor.items():
-                    if k.startswith('Tccd') and v:
-                        t = list(v.values())[0]
-                        if isinstance(t, (int, float)):
-                            ccds.append(t)
-                if ccds and self.AMD_CORE_COUNT % len(ccds) == 0:
-                    temperature = dict(enumerate(sum([[t] * (self.AMD_CORE_COUNT // len(ccds)) for t in ccds], [])))
-                elif (
-                    'Tdie' in amd_sensor and
-                    amd_sensor['Tdie'] and
-                    isinstance(list(amd_sensor['Tdie'].values())[0], (int, float))
-                ):
-                    temperature = dict(enumerate([list(amd_sensor['Tdie'].values())[0]] * self.AMD_CORE_COUNT))
-                elif (
-                    'Tctl' in amd_sensor and
-                    amd_sensor['Tctl'] and
-                    isinstance(list(amd_sensor['Tctl'].values())[0], (int, float))
-                ):
-                    temperature = dict(enumerate([list(amd_sensor['Tctl'].values())[0]] * self.AMD_CORE_COUNT))
+                temperature = self._amd_cpu_temperature(amd_sensor)
             else:
                 core = 0
                 for chip, value in sensors.items():
@@ -367,6 +332,54 @@ class RealtimeEventSource(EventSource):
                                 break
 
         return temperature
+
+    AMD_PREFER_TDIE = (
+        # https://github.com/torvalds/linux/blob/master/drivers/hwmon/k10temp.c#L121
+        # static const struct tctl_offset tctl_offset_table[] = {
+        "AMD Ryzen 5 1600X",
+        "AMD Ryzen 7 1700X",
+        "AMD Ryzen 7 1800X",
+        "AMD Ryzen 7 2700X",
+        "AMD Ryzen Threadripper 19",
+        "AMD Ryzen Threadripper 29",
+    )
+    AMD_SYSTEM_INFO = None
+
+    def _amd_cpu_temperature(self, amd_sensor):
+        if self.AMD_SYSTEM_INFO is None:
+            self.AMD_SYSTEM_INFO = self.middleware.call_sync('system.cpu_info')
+
+        cpu_model = self.AMD_SYSTEM_INFO['cpu_model']
+        core_count = self.AMD_SYSTEM_INFO['physical_core_count']
+
+        ccds = []
+        for k, v in amd_sensor.items():
+            if k.startswith('Tccd') and v:
+                t = list(v.values())[0]
+                if isinstance(t, (int, float)):
+                    ccds.append(t)
+        has_tdie = (
+            'Tdie' in amd_sensor and
+            amd_sensor['Tdie'] and
+            isinstance(list(amd_sensor['Tdie'].values())[0], (int, float))
+        )
+        if cpu_model.startswith(self.AMD_PREFER_TDIE) and has_tdie:
+            return self._amd_cpu_tdie_temperature(amd_sensor, core_count)
+        elif ccds and core_count % len(ccds) == 0:
+            return dict(enumerate(sum([[t] * (core_count // len(ccds)) for t in ccds], [])))
+        elif has_tdie:
+            return self._amd_cpu_tdie_temperature(amd_sensor, core_count)
+        elif (
+            'Tctl' in amd_sensor and
+            amd_sensor['Tctl'] and
+            isinstance(list(amd_sensor['Tctl'].values())[0], (int, float))
+        ):
+            return dict(enumerate([list(amd_sensor['Tctl'].values())[0]] * core_count))
+        elif 'temp1' in amd_sensor and 'temp1_input' in amd_sensor['temp1']:
+            return dict(enumerate([amd_sensor['temp1']['temp1_input']] * core_count))
+
+    def _amd_cpu_tdie_temperature(self, amd_sensor, core_count):
+        return dict(enumerate([list(amd_sensor['Tdie'].values())[0]] * core_count))
 
 
 def setup(middleware):

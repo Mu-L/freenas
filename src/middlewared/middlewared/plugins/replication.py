@@ -1,8 +1,9 @@
 from datetime import datetime, time
 import os
+import re
 
 from middlewared.common.attachment import FSAttachmentDelegate
-from middlewared.schema import accepts, Bool, Cron, Dataset, Dict, Int, List, Patch, Str
+from middlewared.schema import accepts, Bool, Cron, Dataset, Dict, Int, List, Patch, returns, Str
 from middlewared.service import item_method, job, private, CallError, CRUDService, ValidationErrors
 import middlewared.sqlalchemy as sa
 from middlewared.utils.path import is_child
@@ -29,6 +30,7 @@ class ReplicationModel(sa.Model):
     repl_source_datasets = sa.Column(sa.JSON(type=list))
     repl_exclude = sa.Column(sa.JSON(type=list))
     repl_naming_schema = sa.Column(sa.JSON(type=list))
+    repl_name_regex = sa.Column(sa.String(120), nullable=True)
     repl_auto = sa.Column(sa.Boolean(), default=True)
     repl_schedule_minute = sa.Column(sa.String(100), nullable=True, default="00")
     repl_schedule_hour = sa.Column(sa.String(100), nullable=True, default="*")
@@ -42,6 +44,7 @@ class ReplicationModel(sa.Model):
     repl_retention_policy = sa.Column(sa.String(120), default="NONE")
     repl_lifetime_unit = sa.Column(sa.String(120), nullable=True, default='WEEK')
     repl_lifetime_value = sa.Column(sa.Integer(), nullable=True, default=2)
+    repl_lifetimes = sa.Column(sa.JSON(type=list))
     repl_large_block = sa.Column(sa.Boolean(), default=True)
     repl_embed = sa.Column(sa.Boolean(), default=False)
     repl_compressed = sa.Column(sa.Boolean(), default=True)
@@ -167,6 +170,7 @@ class ReplicationService(CRUDService):
                 Str("naming_schema", validators=[ReplicationSnapshotNamingSchema()])]),
             List("also_include_naming_schema", items=[
                 Str("naming_schema", validators=[ReplicationSnapshotNamingSchema()])]),
+            Str("name_regex", null=True, default=None, empty=False),
             Bool("auto", required=True),
             Cron(
                 "schedule",
@@ -189,6 +193,15 @@ class ReplicationService(CRUDService):
             Str("retention_policy", enum=["SOURCE", "CUSTOM", "NONE"], required=True),
             Int("lifetime_value", null=True, default=None, validators=[Range(min=1)]),
             Str("lifetime_unit", null=True, default=None, enum=["HOUR", "DAY", "WEEK", "MONTH", "YEAR"]),
+            List("lifetimes", items=[
+                Dict(
+                    "lifetime",
+                    Cron("schedule"),
+                    Int("lifetime_value", validators=[Range(min=1)], required=True),
+                    Str("lifetime_unit", enum=["HOUR", "DAY", "WEEK", "MONTH", "YEAR"], required=True),
+                    strict=True,
+                ),
+            ]),
             Str("compression", enum=["LZ4", "PIGZ", "PLZIP"], null=True, default=None),
             Int("speed_limit", null=True, default=None, validators=[Range(min=1)]),
             Bool("large_block", default=True),
@@ -226,6 +239,7 @@ class ReplicationService(CRUDService):
           replication task. Only push replication tasks can be bound to periodic snapshot tasks.
         * `naming_schema` is a list of naming schemas for pull replication
         * `also_include_naming_schema` is a list of naming schemas for push replication
+        * `name_regex` will replicate all snapshots which names match specified regular expression
         * `auto` allows replication to run automatically on schedule or after bound periodic snapshot task
         * `schedule` is a schedule to run replication task. Only `auto` replication tasks without bound periodic
           snapshot tasks can have a schedule
@@ -448,12 +462,15 @@ class ReplicationService(CRUDService):
             ("rm", {"name": "schedule"}),
             ("rm", {"name": "only_matching_schedule"}),
             ("rm", {"name": "enabled"}),
+            ("add", Bool("only_from_scratch", default=False)),
         ),
     )
     @job(logs=True)
     async def run_onetime(self, job, data):
         """
         Run replication task without creating it.
+
+        If `only_from_scratch` is `true` then replication will fail if target dataset already exists.
         """
 
         data["name"] = f"Temporary replication task for job {job.id}"
@@ -486,10 +503,11 @@ class ReplicationService(CRUDService):
             if data["naming_schema"]:
                 verrors.add("naming_schema", "This field has no sense for push replication")
 
-            if not snapshot_tasks and not data["also_include_naming_schema"]:
+            if not snapshot_tasks and not data["also_include_naming_schema"] and not data["name_regex"]:
                 verrors.add(
                     "periodic_snapshot_tasks", "You must at least either bind a periodic snapshot task or provide "
-                                               "\"Also Include Naming Schema\" for push replication task"
+                                               "\"Also Include Naming Schema\" or \"Name Regex\" for push replication "
+                                               "task"
                 )
 
             if data["schedule"] is None and data["auto"] and not data["periodic_snapshot_tasks"]:
@@ -503,8 +521,8 @@ class ReplicationService(CRUDService):
             if data["periodic_snapshot_tasks"]:
                 verrors.add("periodic_snapshot_tasks", "Pull replication can't be bound to a periodic snapshot task")
 
-            if not data["naming_schema"]:
-                verrors.add("naming_schema", "Naming schema is required for pull replication")
+            if not data["naming_schema"] and not data["name_regex"]:
+                verrors.add("naming_schema", "Naming schema or Name regex are required for pull replication")
 
             if data["also_include_naming_schema"]:
                 verrors.add("also_include_naming_schema", "This field has no sense for pull replication")
@@ -602,6 +620,15 @@ class ReplicationService(CRUDService):
             if data["only_matching_schedule"]:
                 verrors.add("only_matching_schedule", "You can't have only-matching-schedule without schedule")
 
+        if data["name_regex"]:
+            try:
+                re.compile(f"({data['name_regex']})$")
+            except Exception as e:
+                verrors.add("name_regex", f"Invalid regex: {e}")
+
+            if data["naming_schema"] or data["also_include_naming_schema"]:
+                verrors.add("name_regex", "Naming regex can't be used with Naming schema")
+
         if data["retention_policy"] == "CUSTOM":
             if data["lifetime_value"] is None:
                 verrors.add("lifetime_value", "This field is required for custom retention policy")
@@ -612,6 +639,8 @@ class ReplicationService(CRUDService):
                 verrors.add("lifetime_value", "This field has no sense for specified retention policy")
             if data["lifetime_unit"] is not None:
                 verrors.add("lifetime_unit", "This field has no sense for specified retention policy")
+            if data["lifetimes"]:
+                verrors.add("lifetimes", "This field has no sense for specified retention policy")
 
         if data["enabled"]:
             for i, snapshot_task in enumerate(snapshot_tasks):
@@ -653,6 +682,7 @@ class ReplicationService(CRUDService):
 
     @accepts(Str("transport", enum=["SSH", "SSH+NETCAT", "LOCAL"], required=True),
              Int("ssh_credentials", null=True, default=None))
+    @returns(List("datasets", items=[Str("dataset")]))
     async def list_datasets(self, transport, ssh_credentials):
         """
         List datasets on remote side
@@ -702,6 +732,7 @@ class ReplicationService(CRUDService):
         return await self.middleware.call("zettarepl.create_dataset", dataset, transport, ssh_credentials)
 
     @accepts()
+    @returns(List("naming_schemas", items=[Str("naming_schema")]))
     async def list_naming_schemas(self):
         """
         List all naming schemas used in periodic snapshot and replication tasks.
@@ -724,6 +755,7 @@ class ReplicationService(CRUDService):
         Str("transport", enum=["SSH", "SSH+NETCAT", "LOCAL"], required=True),
         Int("ssh_credentials", null=True, default=None),
     )
+    @returns(Int())
     async def count_eligible_manual_snapshots(self, datasets, naming_schema, transport, ssh_credentials):
         """
         Count how many existing snapshots of `dataset` match `naming_schema`.
@@ -753,9 +785,16 @@ class ReplicationService(CRUDService):
         Str("transport", enum=["SSH", "SSH+NETCAT", "LOCAL", "LEGACY"], required=True),
         Int("ssh_credentials", null=True, default=None),
     )
+    @returns(Dict(
+        additional_attrs=True,
+        example={
+            "backup/work": ["auto-2019-10-15_13-00", "auto-2019-10-15_09-00"],
+            "backup/games": ["auto-2019-10-15_13-00"],
+        },
+    ))
     async def target_unmatched_snapshots(self, direction, source_datasets, target_dataset, transport, ssh_credentials):
         """
-        Check if target has any snapshots that do not exist on source.
+        Check if target has any snapshots that do not exist on source. Returns these snapshots grouped by dataset.
 
         .. examples(websocket)::
 
@@ -771,13 +810,6 @@ class ReplicationService(CRUDService):
                     "SSH",
                     4
                 ]
-            }
-
-        Returns
-
-            {
-                "backup/work": ["auto-2019-10-15_13-00", "auto-2019-10-15_09-00"],
-                "backup/games": ["auto-2019-10-15_13-00"],
             }
         """
         return await self.middleware.call("zettarepl.target_unmatched_snapshots", direction, source_datasets,

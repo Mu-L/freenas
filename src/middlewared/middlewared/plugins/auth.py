@@ -5,15 +5,15 @@ import random
 import re
 import socket
 import string
-import subprocess
 import time
 
-from middlewared.schema import Dict, Int, Str, accepts, Bool
+from middlewared.schema import accepts, Bool, Datetime, Dict, Int, Patch, returns, Str
 from middlewared.service import (
-    ConfigService, Service, filterable, filter_list, no_auth_required, pass_app, private, cli_private, CallError
+    ConfigService, Service, filterable, filterable_returns, filter_list, no_auth_required,
+    pass_app, private, cli_private, CallError,
 )
 import middlewared.sqlalchemy as sa
-from middlewared.utils import osc, Popen
+from middlewared.utils import run
 from middlewared.validators import Range
 
 
@@ -224,6 +224,14 @@ class AuthService(Service):
         self.session_manager.middleware = self.middleware
 
     @filterable
+    @filterable_returns(Dict(
+        'session',
+        Str('id'),
+        Bool('internal'),
+        Str('origin'),
+        Str('credentials'),
+        Datetime('created_at'),
+    ))
     def sessions(self, filters, options):
         """
         Returns list of active auth sessions.
@@ -262,6 +270,7 @@ class AuthService(Service):
         )
 
     @accepts(Str('username'), Str('password'))
+    @returns(Bool(description='Is `true` if `username` was successfully validated with provided `password`'))
     async def check_user(self, username, password):
         """
         Verify username and password
@@ -278,6 +287,7 @@ class AuthService(Service):
         return crypt.crypt(password, user['bsdusr_unixhash']) == user['bsdusr_unixhash']
 
     @accepts(Int('ttl', default=600, null=True), Dict('attrs', additional_attrs=True))
+    @returns(Str('token'))
     def generate_token(self, ttl, attrs):
         """
         Generate a token to be used for authentication.
@@ -305,6 +315,7 @@ class AuthService(Service):
 
     @no_auth_required
     @accepts()
+    @returns(Bool('two_factor_auth_enabled', description='Is `true` if 2FA is enabled'))
     async def two_factor_auth(self):
         """
         Returns true if two factor authorization is required for authorizing user's login.
@@ -313,7 +324,8 @@ class AuthService(Service):
 
     @cli_private
     @no_auth_required
-    @accepts(Str('username'), Str('password'), Str('otp_token', null=True, default=None))
+    @accepts(Str('username'), Str('password', private=True), Str('otp_token', null=True, default=None))
+    @returns(Bool('successful_login'))
     @pass_app()
     async def login(self, app, username, password, otp_token):
         """
@@ -339,6 +351,7 @@ class AuthService(Service):
     @cli_private
     @no_auth_required
     @accepts(Str('api_key'))
+    @returns(Bool('successful_login'))
     @pass_app()
     async def login_with_api_key(self, app, api_key):
         """
@@ -352,6 +365,7 @@ class AuthService(Service):
 
     @cli_private
     @accepts()
+    @returns(Bool('successful_logout'))
     @pass_app()
     async def logout(self, app):
         """
@@ -364,6 +378,7 @@ class AuthService(Service):
     @cli_private
     @no_auth_required
     @accepts(Str('token'))
+    @returns(Bool('successful_login'))
     @pass_app()
     def token(self, app, token):
         """Authenticate using a given `token` id."""
@@ -395,6 +410,21 @@ class TwoFactorAuthService(ConfigService):
         namespace = 'auth.twofactor'
         cli_namespace = 'auth.two_factor'
 
+    ENTRY = Dict(
+        'auth_twofactor_entry',
+        Bool('enabled', required=True),
+        Int('otp_digits', validators=[Range(min=6, max=8)], required=True),
+        Int('window', validators=[Range(min=0)], required=True),
+        Int('interval', validators=[Range(min=5)], required=True),
+        Dict(
+            'services',
+            Bool('ssh', default=False),
+            required=True
+        ),
+        Int('id', required=True),
+        Str('secret', required=True, null=True),
+    )
+
     @private
     async def two_factor_extend(self, data):
         for srv in ['ssh']:
@@ -403,17 +433,11 @@ class TwoFactorAuthService(ConfigService):
         return data
 
     @accepts(
-        Dict(
-            'auth_twofactor_update',
-            Bool('enabled'),
-            Int('otp_digits', validators=[Range(min=6, max=8)]),
-            Int('window', validators=[Range(min=0)]),
-            Int('interval', validators=[Range(min=5)]),
-            Dict(
-                'services',
-                Bool('ssh', default=False)
-            ),
-            update=True
+        Patch(
+            'auth_twofactor_entry', 'auth_twofactor_update',
+            ('rm', {'name': 'id'}),
+            ('rm', {'name': 'secret'}),
+            ('attr', {'update': True}),
         )
     )
     async def do_update(self, data):
@@ -450,6 +474,7 @@ class TwoFactorAuthService(ConfigService):
     @accepts(
         Str('token', null=True)
     )
+    @returns(Bool('token_verified'))
     def verify(self, token):
         """
         Returns boolean true if provided `token` is successfully authenticated.
@@ -464,6 +489,7 @@ class TwoFactorAuthService(ConfigService):
         return totp.verify(token, valid_window=config['window'])
 
     @accepts()
+    @returns(Bool('successfully_renewed_secret'))
     def renew_secret(self):
         """
         Generates a new secret for Two Factor Authentication. Returns boolean true on success.
@@ -486,6 +512,7 @@ class TwoFactorAuthService(ConfigService):
         return True
 
     @accepts()
+    @returns(Str(title='Provisioning URI'))
     async def provisioning_uri(self):
         """
         Returns the provisioning URI for the OTP. This can then be encoded in a QR Code and used to
@@ -495,8 +522,7 @@ class TwoFactorAuthService(ConfigService):
         return pyotp.totp.TOTP(
             config['secret'], interval=config['interval'], digits=config['otp_digits']
         ).provisioning_uri(
-            f'{(await self.middleware.call("system.info"))["hostname"]}@'
-            f'{await self.middleware.call("system.product_name")}',
+            f'{await self.middleware.call("system.hostname")}@{await self.middleware.call("system.product_name")}',
             'iXsystems'
         )
 
@@ -517,21 +543,23 @@ async def check_permission(middleware, app):
         return
 
     remote_addr, remote_port = app.request.transport.get_extra_info('peername')
-
     if not (remote_addr.startswith('127.') or remote_addr == '::1'):
         return
 
-    remote = '{0}:{1}'.format(remote_addr, remote_port)
+    remote = f'{remote_addr}:{remote_port}'
+    data = (await run(['lsof', f'-i@{remote}', '-n', '-Fnu'], encoding='utf-8')).stdout
+    for line in iter(data.splitlines()):
+        key = line[0]
+        value = line[1:]
+        authenticated = True
+        if key == 'u':
+            authenticated &= (key == '0')
+        if key == 'n':
+            authenticated &= (value in remote)
 
-    proc = await Popen([
-        '/usr/bin/sockstat', '-46c', '-p', str(remote_port)
-    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True)
-    data = await proc.communicate()
-    for line in data[0].strip().splitlines()[1:]:
-        cols = line.decode().split()
-        if cols[-3 if osc.IS_LINUX else -2] == remote and cols[0] == 'root':
+        if authenticated:
             AuthService.session_manager.login(app, RootTcpSocketSessionManagerCredentials())
-            break
+            return
 
 
 def setup(middleware):

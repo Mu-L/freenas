@@ -1,14 +1,15 @@
 from .apidocs import app as apidocs_app
 from .client import ejson as json
 from .common.event_source.manager import EventSourceManager
-from .event import EventSource, Events
+from .event import Events
 from .job import Job, JobsQueue
 from .pipe import Pipes, Pipe
 from .restful import RESTfulAPI
+from .settings import conf
 from .schema import Error as SchemaError
 import middlewared.service
 from .service_exception import adapt_exception, CallError, CallException, ValidationError, ValidationErrors
-from .utils import osc, start_daemon_thread, sw_version
+from .utils import osc, sw_version
 from .utils.debug import get_frame_details, get_threads_stacks
 from .utils.lock import SoftHardSemaphore, SoftHardSemaphoreLimit
 from .utils.io_thread_pool_executor import IoThreadPoolExecutor
@@ -23,7 +24,7 @@ from aiohttp import web
 from aiohttp.web_exceptions import HTTPPermanentRedirect
 from aiohttp.web_middlewares import normalize_path_middleware
 from aiohttp_wsgi import WSGIHandler
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import argparse
 import asyncio
@@ -32,6 +33,8 @@ from collections import namedtuple
 import concurrent.futures
 import concurrent.futures.process
 import concurrent.futures.thread
+import contextlib
+import copy
 import errno
 import fcntl
 import functools
@@ -53,11 +56,11 @@ import traceback
 import types
 import urllib.parse
 import uuid
+import tracemalloc
+
+from systemd.daemon import notify as systemd_notify
 
 from . import logger
-
-if osc.IS_LINUX:
-    from systemd.daemon import notify as systemd_notify
 
 
 class Application(object):
@@ -93,6 +96,11 @@ class Application(object):
         self.__callbacks[name].append(method)
 
     def _send(self, data):
+        self.middleware.socket_messages_queue.append({
+            'type': 'outgoing',
+            'session_id': self.session_id,
+            'message': data,
+        })
         asyncio.run_coroutine_threadsafe(self.response.send_str(json.dumps(data)), loop=self.loop)
 
     def _tb_error(self, exc_info):
@@ -253,6 +261,19 @@ class Application(object):
         self.middleware.unregister_wsclient(self)
 
     async def on_message(self, message):
+        if message.get('msg') == 'method' and message.get('method') and isinstance(message.get('params'), list):
+            log_message = copy.deepcopy(message)
+            log_message['params'] = self.middleware.dump_args(
+                log_message.get('params', []), method_name=log_message['method']
+            )
+        else:
+            log_message = message
+
+        self.middleware.socket_messages_queue.append({
+            'type': 'incoming',
+            'session_id': self.session_id,
+            'message': log_message,
+        })
         # Run callbacks registered in plugins for on_message
         for method in self.__callbacks['on_message']:
             try:
@@ -336,9 +357,12 @@ class FileApplication(object):
         self.loop = loop
         self.jobs = {}
 
-    def register_job(self, job_id):
+    def register_job(self, job_id, buffered):
         self.jobs[job_id] = self.middleware.loop.call_later(
-            60, lambda: asyncio.ensure_future(self._cleanup_job(job_id)))
+            3600 if buffered else 60,  # FIXME: Allow the job to run for infinite time + give 300 seconds to begin
+                                       # download instead of waiting 3600 seconds for the whole operation
+            lambda: asyncio.ensure_future(self._cleanup_job(job_id)),
+        )
 
     async def _cleanup_cancel(self, job_id):
         job_cleanup = self.jobs.pop(job_id, None)
@@ -530,7 +554,8 @@ class ShellWorkerThread(threading.Thread):
     and spawning the reader and writer threads.
     """
 
-    def __init__(self, ws, input_queue, loop, options):
+    def __init__(self, middleware, ws, input_queue, loop, options):
+        self.middleware = middleware
         self.ws = ws
         self.input_queue = input_queue
         self.loop = loop
@@ -540,13 +565,11 @@ class ShellWorkerThread(threading.Thread):
         super(ShellWorkerThread, self).__init__(daemon=True)
 
     def get_command(self, options):
-        allowed_options = ('jail', 'vm_id')
+        allowed_options = ('chart_release', 'vm_id')
         if all(options.get(k) for k in allowed_options):
             raise CallError(f'Only one option is supported from {", ".join(allowed_options)}')
 
-        if options.get('jail'):
-            return ['/usr/local/bin/iocage', 'console', '-f', options['jail']]
-        elif options.get('vm_id'):
+        if options.get('vm_id'):
             if osc.IS_FREEBSD:
                 return ['/usr/bin/cu', '-l', f'nmdm{options["vm_id"]}B']
             else:
@@ -593,36 +616,44 @@ class ShellWorkerThread(threading.Thread):
             Reader thread for reading from pty file descriptor
             and forwarding it to the websocket.
             """
-            while True:
-                try:
-                    read = os.read(master_fd, 1024)
-                except OSError:
-                    break
-                if read == b'':
-                    break
-                asyncio.run_coroutine_threadsafe(
-                    self.ws.send_str(read.decode('utf8', 'ignore')), loop=self.loop
-                ).result()
+            try:
+                while True:
+                    try:
+                        read = os.read(master_fd, 1024)
+                    except OSError:
+                        break
+                    if read == b'':
+                        break
+                    asyncio.run_coroutine_threadsafe(
+                        self.ws.send_bytes(read), loop=self.loop
+                    ).result()
+            except Exception:
+                self.middleware.logger.error("Error in ShellWorkerThread.reader", exc_info=True)
+                self.abort()
 
         def writer():
             """
             Writer thread for reading from input_queue and write to
             the shell pty file descriptor.
             """
-            while True:
-                try:
-                    get = self.input_queue.get(timeout=1)
-                    if isinstance(get, ShellResize):
-                        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", get.rows, get.cols, 0, 0))
-                    else:
-                        os.write(master_fd, get)
-                except queue.Empty:
-                    # If we timeout waiting in input query lets make sure
-                    # the shell process is still alive
+            try:
+                while True:
                     try:
-                        os.kill(self.shell_pid, 0)
-                    except ProcessLookupError:
-                        break
+                        get = self.input_queue.get(timeout=1)
+                        if isinstance(get, ShellResize):
+                            fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", get.rows, get.cols, 0, 0))
+                        else:
+                            os.write(master_fd, get)
+                    except queue.Empty:
+                        # If we timeout waiting in input query lets make sure
+                        # the shell process is still alive
+                        try:
+                            os.kill(self.shell_pid, 0)
+                        except ProcessLookupError:
+                            break
+            except Exception:
+                self.middleware.logger.error("Error in ShellWorkerThread.writer", exc_info=True)
+                self.abort()
 
         t_reader = threading.Thread(target=reader, daemon=True)
         t_reader.start()
@@ -647,6 +678,14 @@ class ShellWorkerThread(threading.Thread):
 
     def die(self):
         self._die = True
+
+    def abort(self):
+        asyncio.run_coroutine_threadsafe(self.ws.close(), self.loop)
+
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(self.shell_pid, signal.SIGTERM)
+
+        self.die()
 
 
 class ShellConnectionData(object):
@@ -685,12 +724,7 @@ class ShellApplication(object):
         async for msg in ws:
             if authenticated:
                 # Add content of every message received in input queue
-                try:
-                    input_queue.put(msg.data.encode())
-                except UnicodeEncodeError:
-                    # Should we handle Encode error?
-                    # xterm.js seems to operate with the websocket in text mode,
-                    pass
+                input_queue.put(msg.data)
             else:
                 try:
                     data = json.loads(msg.data)
@@ -715,7 +749,6 @@ class ShellApplication(object):
                 authenticated = True
 
                 options = data.get('options', {})
-                options['jail'] = data.get('jail') or options.get('jail')
                 if options.get('vm_id'):
                     options['vm_data'] = await self.middleware.call('vm.get_instance', options['vm_id'])
                 if options.get('chart_release_name'):
@@ -727,7 +760,8 @@ class ShellApplication(object):
                     )
 
                 conndata.t_worker = ShellWorkerThread(
-                    ws=ws, input_queue=input_queue, loop=asyncio.get_event_loop(), options=options
+                    middleware=self.middleware, ws=ws, input_queue=input_queue, loop=asyncio.get_event_loop(),
+                    options=options,
                 )
                 conndata.t_worker.start()
 
@@ -786,8 +820,8 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin, ServiceCallMixin):
 
     def __init__(
         self, loop_debug=False, loop_monitor=True, overlay_dirs=None, debug_level=None,
-        log_handler=None, startup_seq_path=None,
-        log_format='[%(asctime)s] (%(levelname)s) %(name)s.%(funcName)s():%(lineno)d - %(message)s'
+        log_handler=None, startup_seq_path=None, trace_malloc=False,
+        log_format='[%(asctime)s] (%(levelname)s) %(name)s.%(funcName)s():%(lineno)d - %(message)s',
     ):
         super().__init__(overlay_dirs)
         self.logger = logger.Logger(
@@ -798,6 +832,7 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin, ServiceCallMixin):
         self.crash_reporting_semaphore = asyncio.Semaphore(value=2)
         self.loop_debug = loop_debug
         self.loop_monitor = loop_monitor
+        self.trace_malloc = trace_malloc
         self.debug_level = debug_level
         self.log_handler = log_handler
         self.log_format = log_format
@@ -824,6 +859,7 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin, ServiceCallMixin):
         self.__console_io = False if os.path.exists(self.CONSOLE_ONCE_PATH) else None
         self.__terminate_task = None
         self.jobs = JobsQueue(self)
+        self.socket_messages_queue = deque(maxlen=1000)
 
     def __init_services(self):
         from middlewared.service import CoreService
@@ -923,7 +959,9 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin, ServiceCallMixin):
                         delay = method._periodic.interval
 
                     method_name = f'{service_name}.{task_name}'
-                    self.logger.debug(f"Setting up periodic task {method_name} to run every {method._periodic.interval} seconds")
+                    self.logger.debug(
+                        f"Setting up periodic task {method_name} to run every {method._periodic.interval} seconds"
+                    )
 
                     self.loop.call_later(
                         delay,
@@ -1140,8 +1178,8 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin, ServiceCallMixin):
                     raise
                 self.__init_procpool()
 
-    def pipe(self):
-        return Pipe(self)
+    def pipe(self, buffered=False):
+        return Pipe(self, buffered)
 
     def _call_prepare(
         self, name, serviceobj, methodobj, params, app=None, io_thread=True, job_on_progress_cb=None, pipes=None,
@@ -1357,6 +1395,63 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin, ServiceCallMixin):
         for thread_id, stack in get_threads_stacks().items():
             self.logger.debug('Thread %d stack:\n%s', thread_id, ''.join(stack))
 
+    def _tracemalloc_start(self, limit, interval):
+        """
+        Run an endless loop grabbing snapshots of allocated memory using
+        the python's builtin "tracemalloc" module.
+
+        `limit` integer representing number of lines to print showing
+                highest memory consumer
+        `interval` integer representing the time in seconds to wait
+                before taking another memory snapshot
+        """
+        # set the thread name
+        osc.set_thread_name('tracemalloc_monitor')
+
+        # initalize tracemalloc
+        tracemalloc.start()
+
+        # if given bogus numbers, default both of them respectively
+        if limit <= 0:
+            limit = 5
+        if interval <= 0:
+            interval = 5
+
+        # filters for the snapshots so we can
+        # ignore modules that we don't care about
+        filters = (
+            tracemalloc.Filter(False, '<frozen importlib._bootstrap>'),
+            tracemalloc.Filter(False, '<frozen importlib._bootstrap_external>'),
+            tracemalloc.Filter(False, '<unknown>'),
+            tracemalloc.Filter(False, '*tracemalloc.py'),
+        )
+
+        # start the loop
+        prev = None
+        while True:
+            if prev is None:
+                prev = tracemalloc.take_snapshot()
+                prev = prev.filter_traces(filters)
+            else:
+                curr = tracemalloc.take_snapshot()
+                curr = curr.filter_traces(filters)
+                diff = curr.compare_to(prev, 'lineno')
+
+                prev = curr
+                curr = None
+                stats = f'\nTop {limit} consumers:'
+                for idx, stat in enumerate(diff[:limit], 1):
+                    stats += f'#{idx}: {stat}\n'
+
+                # print the memory used by the tracemalloc module itself
+                tm_mem = tracemalloc.get_tracemalloc_memory()
+                # add a newline at end of output to make logs more readable
+                stats += f'Memory used by tracemalloc module: {tm_mem:.1f} KiB\n'
+
+                self.logger.debug(stats)
+
+            time.sleep(interval)
+
     async def ws_handler(self, request):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
@@ -1366,6 +1461,14 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin, ServiceCallMixin):
 
         try:
             async for msg in ws:
+                if msg.type == web.WSMsgType.ERROR:
+                    self.logger.error('Websocket error: %r', msg.data)
+                    continue
+
+                if msg.type != web.WSMsgType.TEXT:
+                    self.logger.error('Invalid websocket message type: %r', msg.type)
+                    continue
+
                 if not connection.authenticated and len(msg.data) > 8192:
                     await ws.close(message='Anonymous connection max message length is 8 kB'.encode('utf-8'))
                     break
@@ -1500,6 +1603,13 @@ class Middleware(LoadPluginsMixin, RunInThreadMixin, ServiceCallMixin):
         await web.TCPSite(runner, '0.0.0.0', 6000, reuse_address=True, reuse_port=True).start()
         await web.UnixSite(runner, '/var/run/middlewared.sock').start()
 
+        if self.trace_malloc:
+            limit = self.trace_malloc[0]
+            interval = self.trace_malloc[1]
+            _thr = threading.Thread(target=self._tracemalloc_start, args=(limit, interval,))
+            _thr.setDaemon(True)
+            _thr.start()
+
         self.logger.debug('Accepting connections')
         self._console_write('loading completed\n')
 
@@ -1554,7 +1664,9 @@ def main():
     parser.add_argument('--pidfile', '-P', action='store_true')
     parser.add_argument('--disable-loop-monitor', '-L', action='store_true')
     parser.add_argument('--loop-debug', action='store_true')
+    parser.add_argument('--trace-malloc', '-tm', action='store', nargs=2, type=int, default=False)
     parser.add_argument('--overlay-dirs', '-o', action='append')
+    parser.add_argument('--disable-debug-mode', action='store_true', default=False)
     parser.add_argument('--debug-level', choices=[
         'TRACE',
         'DEBUG',
@@ -1589,9 +1701,12 @@ def main():
         with open(pidpath, "w") as _pidfile:
             _pidfile.write(f"{str(os.getpid())}\n")
 
+    conf.debug_mode = not args.disable_debug_mode
+
     Middleware(
         loop_debug=args.loop_debug,
         loop_monitor=not args.disable_loop_monitor,
+        trace_malloc=args.trace_malloc,
         overlay_dirs=args.overlay_dirs,
         debug_level=args.debug_level,
         log_handler=args.log_handler,

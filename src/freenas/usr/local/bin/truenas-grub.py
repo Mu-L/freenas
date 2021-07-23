@@ -8,16 +8,15 @@ from middlewared.utils.db import query_config_table
 
 if __name__ == "__main__":
     advanced = query_config_table("system_advanced", prefix="adv_")
+    kernel_extra_args = advanced.get('kernel_extra_options') or ''
 
     # We need to allow tpm in grub as sedutil-cli requires it
     # TODO: Please remove kernel flag to use cgroups v1 when nvidia device plugin starts working
     #  with it ( https://github.com/NVIDIA/k8s-device-plugin/issues/235 )
-    # We set mpt3sas argument because of https://jira.ixsystems.com/browse/NAS-109947, let's please
-    # remove setting it once it is fixed upstream. ( https://bugzilla.redhat.com/show_bug.cgi?id=1878332 )
     config = [
         'GRUB_DISTRIBUTOR="TrueNAS Scale"',
-        'GRUB_CMDLINE_LINUX_DEFAULT="libata.allow_tpm=1 systemd.unified_cgroup_hierarchy=0 '
-        'amd_iommu=on iommu=pt kvm_amd.npt=1 kvm_amd.avic=1 intel_iommu=on mpt3sas.max_queue_depth=10000"',
+        'GRUB_CMDLINE_LINUX_DEFAULT="libata.allow_tpm=1 systemd.unified_cgroup_hierarchy=0 amd_iommu=on iommu=pt '
+        f'kvm_amd.npt=1 kvm_amd.avic=1 intel_iommu=on{f" {kernel_extra_args}" if kernel_extra_args else ""}"',
     ]
 
     terminal = ["console"]
@@ -37,8 +36,11 @@ if __name__ == "__main__":
         #
         # We should test this on systems with higher memory as there are contradicting
         # docs - https://www.suse.com/support/kb/doc/?id=000016171
+        # With our custom kernel, having 256MB RAM as base is not enough.
+        # In my tests it worked with having 400MB as base RAM.
+        # TODO: Let's please see what we can do to bring this down on the kernel side perhaps
         current_mem = psutil.virtual_memory().total / 1024
-        cmdline.append(f"crashkernel={256 + math.ceil(current_mem / 16 / 1024 / 1024)}M")
+        cmdline.append(f"crashkernel={400 + math.ceil(current_mem / 16 / 1024 / 1024)}M")
 
     config.append(f'GRUB_TERMINAL="{" ".join(terminal)}"')
     config.append(f'GRUB_CMDLINE_LINUX="{" ".join(cmdline)}"')

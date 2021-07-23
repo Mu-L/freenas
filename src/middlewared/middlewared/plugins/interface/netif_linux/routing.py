@@ -14,7 +14,7 @@ from .address.types import AddressFamily
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["Route", "RouteFlags", "RoutingTable", "RouteTable", "IPRoute"]
+__all__ = ["Route", "RouteFlags", "RoutingTable", "RouteTable", "IPRoute", "RuleTable"]
 
 DEFAULT_TABLE_ID = 254  # This is the default table named as "main" and most of what we do happens here
 ip = IPRoute()
@@ -74,6 +74,14 @@ class RouteTable:
     def __init__(self, table_id, table_name):
         self.table_id = table_id
         self.table_name = table_name
+
+    def create(self):
+        with open("/etc/iproute2/rt_tables", "a+") as f:
+            f.write(f'{self.table_id} {self.table_name}\n')
+
+    @property
+    def exists(self):
+        return self.table_name in RoutingTable().routing_tables
 
     @property
     def is_reserved(self):
@@ -225,3 +233,35 @@ class RoutingTable:
             kwargs[key] = value
 
         ip.route(op, **kwargs)
+
+
+class RuleTable:
+
+    @property
+    def rules(self):
+        rules = []
+        tables = {t.table_id: t for t in RoutingTable().routing_tables.values()}
+        for rule in filter(lambda r: r.get('attrs'), ip.get_rules()):
+            attrs = dict(rule['attrs'])
+            if not all(k in attrs for k in ('FRA_TABLE', 'FRA_PRIORITY')):
+                continue
+
+            rules.append({
+                'table': tables[attrs['FRA_TABLE']],
+                'priority': attrs['FRA_PRIORITY'],
+                'source_addr': attrs.get('FRA_SRC'),
+            })
+
+        return rules
+
+    def add_rule(self, table_id, priority, source_addr=None):
+        kwargs = {'table': table_id, 'priority': priority}
+        if source_addr:
+            kwargs['src'] = source_addr
+        ip.rule('add', **kwargs)
+
+    def delete_rule(self, priority):
+        ip.rule('delete', priority=priority)
+
+    def rule_exists(self, priority):
+        return any(priority == rule['priority'] for rule in self.rules)

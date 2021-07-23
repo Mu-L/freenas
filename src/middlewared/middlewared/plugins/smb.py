@@ -5,6 +5,7 @@ from middlewared.service import accepts, job, private, SharingService, SystemSer
 from middlewared.service_exception import CallError
 import middlewared.sqlalchemy as sa
 from middlewared.utils import osc, Popen, run
+from pathlib import Path
 
 import asyncio
 import codecs
@@ -71,6 +72,13 @@ class SMBBuiltin(enum.Enum):
     def sids():
         return [x.value[1] for x in SMBBuiltin]
 
+    def by_rid(rid):
+        for x in SMBBuiltin:
+            if x.value[1].endswith(str(rid)):
+                return x
+
+        return None
+
 
 class SMBPath(enum.Enum):
     GLOBALCONF = ('/usr/local/etc/smb4.conf', '/etc/smb4.conf', 0o755, False)
@@ -125,22 +133,6 @@ class SMBSharePreset(enum.Enum):
             'ixnas:default_user_quota=1T' if osc.IS_FREEBSD else 'zfs_core:base_user_quota=1T',
         ])
     }}
-    MULTI_PROTOCOL_AFP = {"verbose_name": "Multi-protocol (AFP/SMB) shares", "params": {
-        'acl': True,
-        'aapl_name_mangling': True,
-        'streams': True,
-        'durablehandle': False,
-        'auxsmbconf': '\n'.join([
-            'fruit:locking = netatalk',
-            'fruit:metadata = netatalk',
-            'fruit:resource = file',
-            'streams_xattr:prefix = user.',
-            'streams_xattr:store_stream_type = no',
-            'oplocks = no',
-            'level2 oplocks = no',
-            'strict locking = auto',
-        ])
-    }}
     MULTI_PROTOCOL_NFS = {"verbose_name": "Multi-protocol (NFSv3/SMB) shares", "params": {
         'acl': False,
         'streams': False,
@@ -190,6 +182,7 @@ class SMBModel(sa.Model):
     cifs_srv_admin_group = sa.Column(sa.String(120), nullable=True, default="")
     cifs_srv_next_rid = sa.Column(sa.Integer(), nullable=False)
     cifs_srv_secrets = sa.Column(sa.EncryptedText(), nullable=True)
+    cifs_srv_multichannel = sa.Column(sa.Boolean, default=False)
 
 
 class WBCErr(enum.Enum):
@@ -532,6 +525,11 @@ class SMBService(SystemServiceService):
         except ValidationErrors as errs:
             verrors.add_child('smb_update.smb_options', errs)
 
+        if new.get('multichannel', False) is True:
+            verrors.add(
+                'smb_update.multichannel',
+                'Multichannel SMB is not supported at this time'
+            )
         if new.get('unixcharset') and new['unixcharset'] not in await self.unixcharset_choices():
             verrors.add(
                 'smb_update.unixcharset',
@@ -617,6 +615,10 @@ class SMBService(SystemServiceService):
             except (ValueError, TypeError):
                 verrors.add(f'smb_update.{i}', 'Not a valid mask')
 
+        if not new['aapl_extensions']:
+            if await self.middleware.call('sharing.smb.query', [['afp', '=', True]], {'count': True}):
+                verrors.add('smb_update.aapl_extensions', 'This option must be enabled when AFP shares are present')
+
     @accepts(Dict(
         'smb_update',
         Str('netbiosname', max_length=15),
@@ -635,6 +637,7 @@ class SMBService(SystemServiceService):
         Str('filemask'),
         Str('dirmask'),
         Bool('ntlmv1_auth'),
+        Bool('multichannel', default=False),
         List('bindip', items=[IPAddr('ip')]),
         Str('smb_options', max_length=None),
         update=True,
@@ -740,12 +743,14 @@ class SharingSMBModel(sa.Model):
     cifs_durablehandle = sa.Column(sa.Boolean())
     cifs_streams = sa.Column(sa.Boolean())
     cifs_timemachine = sa.Column(sa.Boolean(), default=False)
+    cifs_timemachine_quota = sa.Column(sa.Integer(), default=0)
     cifs_vuid = sa.Column(sa.String(36))
     cifs_shadowcopy = sa.Column(sa.Boolean())
     cifs_fsrvp = sa.Column(sa.Boolean())
     cifs_enabled = sa.Column(sa.Boolean(), default=True)
     cifs_share_acl = sa.Column(sa.Text())
-    cifs_cluster_volname = sa.Column(sa.String(255), nullable=False)
+    cifs_cluster_volname = sa.Column(sa.String(255))
+    cifs_afp = sa.Column(sa.Boolean())
 
 
 class SharingSMBService(SharingService):
@@ -793,6 +798,7 @@ class SharingSMBService(SharingService):
         Bool('ro', default=False),
         Bool('browsable', default=True),
         Bool('timemachine', default=False),
+        Int('timemachine_quota', default=0),
         Bool('recyclebin', default=False),
         Bool('guestok', default=False),
         Bool('abe', default=False),
@@ -807,6 +813,7 @@ class SharingSMBService(SharingService):
         Str('auxsmbconf', max_length=None, default=''),
         Bool('enabled', default=True),
         Str('cluster_volname', default=''),
+        Bool('afp', default=False),
         register=True
     ))
     async def do_create(self, data):
@@ -847,6 +854,7 @@ class SharingSMBService(SharingService):
 
         await self.clean(data, 'sharingsmb_create', verrors)
         await self.validate(data, 'sharingsmb_create', verrors)
+        await self.legacy_afp_check(data, 'sharingsmb_create', verrors)
 
         verrors.check()
 
@@ -913,6 +921,7 @@ class SharingSMBService(SharingService):
         new['vuid'] = await self.generate_vuid(new['timemachine'], new['vuid'])
         await self.clean(new, 'sharingsmb_update', verrors, id=id)
         await self.validate(new, 'sharingsmb_update', verrors, old=old)
+        await self.legacy_afp_check(new, 'sharingsmb_update', verrors)
 
         verrors.check()
 
@@ -1082,6 +1091,28 @@ class SharingSMBService(SharingService):
         return result
 
     @private
+    async def legacy_afp_check(self, data, schema, verrors):
+        to_check = Path(data['path']).resolve(strict=False)
+        legacy_afp = await self.query([
+            ("afp", "=", True),
+            ("enabled", "=", True),
+            ("id", "!=", data.get("id"))
+        ])
+        for share in legacy_afp:
+            if share['afp'] == data['afp']:
+                continue
+            s = Path(share['path']).resolve(strict=(not share['locked']))
+            if s.is_relative_to(to_check) or to_check.is_relative_to(s):
+                verrors.add(
+                    f"{schema}.afp",
+                    "Compatibility settings for legacy AFP shares (paths that once hosted "
+                    "AFP shares that have been converted to SMB shares) must be "
+                    "consistent with the legacy AFP compatibility settings of any existing SMB "
+                    f"share that exports the same paths. The new share [{data['name']}] conflicts "
+                    f"with share [{share['name']}] on path [{share['path']}]."
+                )
+
+    @private
     async def check_aapl(self, data):
         """
         Returns whether we changed the global aapl support settings.
@@ -1207,6 +1238,10 @@ class SharingSMBService(SharingService):
         if data.get('path_suffix') and len(data['path_suffix'].split('/')) > 2:
             verrors.add(f'{schema_name}.name',
                         'Path suffix may not contain more than two components.')
+
+        if data['afp']:
+            if not (await self.middleware.call('smb.config'))['aapl_extensions']:
+                verrors.add(f'{schema_name}.afp', 'Please enable Apple extensions first.')
 
     @private
     async def home_exists(self, home, schema_name, verrors, old=None):
@@ -1388,6 +1423,7 @@ async def pool_post_import(middleware, pool):
         By the time the post-import hook is called, the smb.configure should have
         already completed and initialized the SMB service.
         """
+        await middleware.call('smb.disable_acl_if_trivial')
         asyncio.ensure_future(middleware.call('sharing.smb.sync_registry'))
         return
 
@@ -1398,6 +1434,7 @@ async def pool_post_import(middleware, pool):
             ('path', '^', f'{path}/'),
         ])
     ]):
+        await middleware.call('smb.disable_acl_if_trivial')
         asyncio.ensure_future(middleware.call('sharing.smb.sync_registry'))
 
 
@@ -1414,6 +1451,7 @@ class SMBFSAttachmentDelegate(LockableFSAttachmentDelegate):
         mDNS may need to be reloaded if a time machine share is located on
         the share being attached.
         """
+        await self.middleware.call('smb.disable_acl_if_trivial')
         reg_sync = await self.middleware.call('sharing.smb.sync_registry')
         await reg_sync.wait()
         await self.middleware.call('service.reload', 'mdns')

@@ -51,15 +51,28 @@ def test_04_get_chart_release_nic_choices():
     assert interface in results.json(), results.text
 
 
+@pytest.mark.dependency(name='ipfs_version')
 def test_05_get_ipfs_version():
     global ipfs_version
-    results = POST('/catalog/items/', {'label': 'OFFICIAL'})
-    ipfs_version = list(results.json()['charts']['ipfs']['versions'].keys())[0]
+    payload = {
+        'label': 'OFFICIAL',
+        'options': {
+            'retrieve_versions': True
+        }
+    }
+    results = POST('/catalog/items/', payload)
+    assert results.status_code == 200, results.text
+    job_id = results.json()
+    job_status = wait_on_job(job_id, 300)
+    assert job_status['state'] == 'SUCCESS', str(job_status['results'])
+    results = job_status['results']['result']
+    assert isinstance(results, dict), str(job_status['results'])
+    ipfs_version = list(results['charts']['ipfs']['versions'].keys())[0]
 
 
 @pytest.mark.dependency(name='release_ipfs')
 def test_06_create_ipfs_chart_release(request):
-    depends(request, ['setup_kubernetes'], scope='session')
+    depends(request, ['setup_kubernetes', 'ipfs_version'], scope='session')
     global release_id
     payload = {
         'catalog': 'OFFICIAL',
@@ -157,7 +170,11 @@ def test_16_set_ipfs_chart_release_scale(request):
     }
     results = POST('/chart/release/scale/', payload)
     assert results.status_code == 200, results.text
-    assert isinstance(results.json(), dict), results.text
+    job_id = results.json()
+    job_status = wait_on_job(job_id, 300)
+    assert job_status['state'] == 'SUCCESS', str(job_status['results'])
+    results = job_status['results']['result']
+    assert isinstance(results, dict), str(job_status['results'])
 
 
 def test_17_verify_ipfs_pod_status_desired_is_1(request):
@@ -331,14 +348,18 @@ def test_31_set_custom_catalog_for_testing_update():
     }
     results = POST('/catalog/', payload)
     assert results.status_code == 200, results.text
-    assert isinstance(results.json(), dict), results.text
+    job_id = results.json()
+    job_status = wait_on_job(job_id, 300)
+    assert job_status['state'] == 'SUCCESS', str(job_status['results'])
+    results = job_status['results']['result']
+    assert isinstance(results, dict), results.text
     # the sleep is needed or /catalog/items is not ready on time.
     time.sleep(5)
 
 
 @pytest.mark.parametrize('key', list(updatechart_catalog.keys()))
 def test_32_verify_updatechart_catalog_object(key):
-    assert results.json()[key] == updatechart_catalog[key], results.text
+    assert results[key] == updatechart_catalog[key], results.text
 
 
 def test_33_verify_updatechart_is_in_catalog_list():
@@ -356,16 +377,29 @@ def test_34_verify_updatechart_catalog_object(key):
     assert results.json()[key] == updatechart_catalog[key], results.text
 
 
+@pytest.mark.dependency(name='plex_version')
 def test_35_get_plex_old_version():
     global old_plex_version, new_plex_version
-    results = POST('/catalog/items/', {'label': 'UPDATECHARTS'})
-    old_plex_version = sorted(list(results.json()['charts']['plex']['versions'].keys()))[0]
-    new_plex_version = sorted(list(results.json()['charts']['plex']['versions'].keys()))[-1]
+    payload = {
+        'label': 'UPDATECHARTS',
+        'options': {
+            'retrieve_versions': True
+        }
+    }
+    results = POST('/catalog/items/', payload)
+    assert results.status_code == 200, results.text
+    job_id = results.json()
+    job_status = wait_on_job(job_id, 300)
+    assert job_status['state'] == 'SUCCESS', str(job_status['results'])
+    results = job_status['results']['result']
+    assert isinstance(results, dict), str(job_status['results'])
+    old_plex_version = sorted(list(results['charts']['plex']['versions'].keys()))[0]
+    new_plex_version = sorted(list(results['charts']['plex']['versions'].keys()))[-1]
 
 
 @pytest.mark.dependency(name='release_plex')
 def test_36_create_plex_chart_release_with_old_version(request):
-    depends(request, ['setup_kubernetes'], scope='session')
+    depends(request, ['setup_kubernetes', 'plex_version'], scope='session')
     global plex_id
     payload = {
         'catalog': 'UPDATECHARTS',

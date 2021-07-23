@@ -241,8 +241,6 @@ class LDAPQuery(object):
                 if self.ldap['certificate']:
                     try:
                         res = self._handle.sasl_non_interactive_bind_s('EXTERNAL')
-                        if self.ldap['verbose_logging']:
-                            self.logger.debug('Successfully bound to [%s] using client certificate.', server)
                         break
                     except Exception as e:
                         saved_simple_error = e
@@ -1054,6 +1052,7 @@ class LDAPService(ConfigService):
             cache_data['groups'].update({g.gr_name: {
                 'id': group_next_index,
                 'gid': g.gr_gid,
+                'name': g.gr_name,
                 'group': g.gr_name,
                 'builtin': False,
                 'sudo': False,

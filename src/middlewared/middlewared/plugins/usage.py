@@ -203,12 +203,11 @@ class UsageService(Service):
 
     async def gather_hardware(self, context):
         network = context['network']
-        info = await self.middleware.call('system.info')
 
         return {
             'hardware': {
-                'cpus': info['cores'],
-                'memory': info['physmem'],
+                'cpus': (await self.middleware.call('system.cpu_info'))['core_count'],
+                'memory': (await self.middleware.call('system.mem_info'))['physmem_size'],
                 'nics': len(network),
                 'disks': [
                     {k: disk[k]} for disk in await self.middleware.call('disk.query') for k in ['model']
@@ -267,24 +266,6 @@ class UsageService(Service):
 
         return output
 
-    async def gather_jails_freebsd(self, context):
-        try:
-            jails = await self.middleware.call('jail.query')
-        except Exception:
-            jails = []
-        jail_list = []
-
-        for j in jails:
-            jail_list.append(
-                {
-                    'nat': bool(j['nat']),
-                    'release': j['release'],
-                    'vnet': bool(j['vnet'])
-                }
-            )
-
-        return {'jails': jail_list}
-
     async def gather_network(self, context):
         network = context['network']
 
@@ -302,13 +283,13 @@ class UsageService(Service):
 
         async def gather_lags():
             lag_list = []
-            for l in network:
-                if l['type'] == 'LINK_AGGREGATION':
+            for i in network:
+                if i['type'] == 'LINK_AGGREGATION':
                     lag_list.append(
                         {
-                            'members': l['lag_ports'],
-                            'mtu': l['mtu'],
-                            'type': l['lag_protocol']
+                            'members': i['lag_ports'],
+                            'mtu': i['mtu'],
+                            'type': i['lag_protocol']
                         }
                     )
             return {'lags': lag_list}
@@ -349,8 +330,7 @@ class UsageService(Service):
         return {'network': {**bridges, **lags, **phys, **vlans}}
 
     async def gather_system_version(self, context):
-        system = await self.middleware.call('system.info')
-        return {'version': system['version']}
+        return {'version': await self.middleware.call('system.version')}
 
     async def retrieve_system_hash(self):
         return await self.middleware.call('system.host_id')
@@ -455,7 +435,7 @@ class UsageService(Service):
         return {'services': service_list}
 
     async def gather_sharing(self, context):
-        services = ['afp', 'iscsi', 'nfs', 'smb', 'webdav']
+        services = ['iscsi', 'nfs', 'smb', 'webdav']
         sharing_list = []
 
         async def gather_service(service):
@@ -479,17 +459,6 @@ class UsageService(Service):
                             'acl': s['acl'],
                             'fsrvp': s['fsrvp'],
                             'streams': s['streams'],
-                        }
-                    )
-                elif service == 'afp':
-                    sharing_list.append(
-                        {
-                            'type': service.upper(),
-                            'home': s['home'],
-                            'timemachine': s['timemachine'],
-                            'zerodev': s['nodev'],
-                            'nostat': s['nostat'],
-                            'unixpriv': s['upriv']
                         }
                     )
                 elif service == 'nfs':

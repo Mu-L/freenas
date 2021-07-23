@@ -1,7 +1,7 @@
 import middlewared.sqlalchemy as sa
 
-from middlewared.schema import Bool, Dict
-from middlewared.service import accepts, ConfigService
+from middlewared.schema import Bool, Dict, Int
+from middlewared.service import ConfigService
 
 
 class ContainerModel(sa.Model):
@@ -17,13 +17,12 @@ class ContainerService(ConfigService):
         datastore = 'services.container'
         cli_namespace = 'app.container.config'
 
-    @accepts(
-        Dict(
-            'container_update',
-            Bool('enable_image_updates'),
-            update=True,
-        )
+    ENTRY = Dict(
+        'container_entry',
+        Bool('enable_image_updates'),
+        Int('id'),
     )
+
     async def do_update(self, data):
         """
         When `enable_image_updates` is set, system will check if existing container images need to be updated. System

@@ -132,12 +132,9 @@ class SharingSMBService(Service):
         gl.update({
             'fruit_enabled': globalconf.get('fruit_enabled', None),
             'ad_enabled': globalconf.get('ad_enabled', None),
-            'afp_shares': globalconf.get('afp_shares', None),
             'nfs_exports': globalconf.get('nfs_exports', None),
             'smb_shares': globalconf.get('smb_shares', None)
         })
-        if gl['afp_shares'] is None:
-            gl['afp_shares'] = await self.middleware.call('sharing.afp.query', [['enabled', '=', True]])
         if gl['nfs_exports'] is None:
             gl['nfs_exports'] = await self.middleware.call('sharing.nfs.query', [['enabled', '=', True]])
         if gl['smb_shares'] is None:
@@ -156,8 +153,8 @@ class SharingSMBService(Service):
     @private
     async def order_vfs_objects(self, vfs_objects):
         vfs_objects_special = ('catia', 'zfs_space', 'fruit', 'streams_xattr', 'shadow_copy_zfs',
-                               'noacl', 'ixnas', 'acl_xattr', 'zfsacl', 'crossrename', 'recycle',
-                               'zfs_core', 'aio_fbsd', 'io_uring')
+                               'noacl', 'ixnas', 'acl_xattr', 'zfsacl', 'nfs4acl_xattr',
+                               'crossrename', 'recycle', 'zfs_core', 'aio_fbsd', 'io_uring')
 
         vfs_objects_ordered = []
 
@@ -249,18 +246,6 @@ class SharingSMBService(Service):
                                            data['id'], {'cifs_durablehandle': False})
                 data['durablehandle'] = False
 
-        if any(filter(lambda x: f"{x['path']}/" in f"{conf['path']}/" or f"{conf['path']}/" in f"{x['path']}/", gl['afp_shares'])):
-            self.logger.debug("SMB share [%s] is also an AFP share. "
-                              "Applying parameters for mixed-protocol share.", data['name'])
-            conf.update({
-                "fruit:locking": "netatalk",
-                "fruit:metadata": "netatalk",
-                "fruit:resource": "file",
-                "strict locking": "auto",
-                "streams_xattr:prefix": "user.",
-                "streams_xattr:store_stream_type": "no"
-            })
-
     @private
     @filterable
     async def registry_query(self, filters, options):
@@ -337,8 +322,24 @@ class SharingSMBService(Service):
             data['path_suffix'] = '%U'
 
         if data['path']:
+            try:
+                ds = await self.middleware.call('pool.dataset.from_path', data['path'], False)
+                acltype = ds['acltype']['value']
+            except Exception:
+                self.logger.warning("Failed to obtain ZFS dataset for path %s. "
+                                    "Unable to automatically configuration ACL settings.",
+                                    data['path'], exc_info=True)
+                acltype = "UNKNOWN"
             conf['path'] = '/'.join([data['path'], data['path_suffix']]) if data['path_suffix'] else data['path']
         else:
+            """
+            An empty path may be valid for a [homes] share.
+            In this situation, samba will generate the share path during TCON
+            using user's home directory. This makes it impossible for us to
+            determine correct configuration for share, but some customers rely
+            on this particular old samba feature.
+            """
+            acltype = "UNKNOWN"
             conf['path'] = ''
 
         if osc.IS_FREEBSD:
@@ -366,7 +367,23 @@ class SharingSMBService(Service):
             if osc.IS_FREEBSD:
                 data['vfsobjects'].append('ixnas')
             else:
-                data['vfsobjects'].append('acl_xattr')
+                if acltype == "NFSV4":
+                    data['vfsobjects'].append('nfs4acl_xattr')
+                    conf.update({
+                        "nfs4acl_xattr:nfs4_id_numeric": "yes",
+                        "nfs4acl_xattr:validate_mode": "no",
+                        "nfs4acl_xattr:xattr_name": "system.nfs4_acl_xdr",
+                        "nfs4acl_xattr:encoding": "xdr",
+                    })
+                elif acltype == "POSIX" or acltype == "UNKNOWN":
+                    data['vfsobjects'].append('acl_xattr')
+                    conf['inherit acls'] = 'yes'
+                else:
+                    self.logger.debug("ACLs are disabled on path %s. "
+                                      "Disabling NT ACL support.",
+                                      data['path'])
+                    conf["nt acl support"] = "no"
+
         elif osc.IS_FREEBSD:
             data['vfsobjects'].append('noacl')
         else:
@@ -434,6 +451,17 @@ class SharingSMBService(Service):
         if data['timemachine']:
             conf["fruit:time machine"] = "yes"
             conf["fruit:locking"] = "none"
+
+            if data['timemachine_quota']:
+                conf['fruit:time machine max size'] = f'{data["timemachine_quota"]}G'
+
+        if data['afp']:
+            conf['fruit:encoding'] = 'native'
+            conf['fruit:metadata'] = 'netatalk'
+            conf['fruit:resource'] = 'file'
+            conf['streams_xattr:prefix'] = 'user.'
+            conf['streams_xattr:store_stream_type'] = 'no'
+            conf['streams_xattr:xattr_compat'] = 'true'
 
         if data['recyclebin']:
             conf.update({

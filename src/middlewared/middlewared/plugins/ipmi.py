@@ -3,7 +3,8 @@ try:
 except ImportError:
     kld = None
 
-from middlewared.schema import Bool, Dict, Int, IPAddr, Str, accepts
+from middlewared.plugins.ipmi_.utils import parse_ipmitool_output
+from middlewared.schema import accepts, Bool, Dict, Int, IPAddr, List, Patch, returns, Str
 from middlewared.service import CallError, CRUDService, filterable, ValidationErrors
 from middlewared.utils import filter_list, run
 from middlewared.validators import Netmask
@@ -20,7 +21,15 @@ class IPMIService(CRUDService):
     class Config:
         cli_namespace = 'network.ipmi'
 
+    # TODO: Test me please
+    ENTRY = Patch(
+        'ipmi_update', 'ipmi_entry',
+        ('add', Int('id', required=True)),
+        ('add', Int('channel', required=True)),
+    )
+
     @accepts()
+    @returns(Bool('ipmi_loaded'))
     async def is_loaded(self):
         """
         Returns a boolean true value indicating if ipmi device is loaded.
@@ -28,6 +37,7 @@ class IPMIService(CRUDService):
         return os.path.exists('/dev/ipmi0')
 
     @accepts()
+    @returns(List('ipmi_channels', items=[Int('ipmi_channel')]))
     async def channels(self):
         """
         Return a list with the IPMI channels available.
@@ -76,13 +86,14 @@ class IPMIService(CRUDService):
         return filter_list(result, filters, options)
 
     @accepts(Int('channel'), Dict(
-        'ipmi',
+        'ipmi_update',
         IPAddr('ipaddress', v6=False),
         Str('netmask', validators=[Netmask(ipv6=False, prefix_length=False)]),
         IPAddr('gateway', v6=False),
         Str('password', private=True),
         Bool('dhcp'),
         Int('vlan', null=True),
+        register=True
     ))
     async def do_update(self, id, data):
         """
@@ -156,6 +167,7 @@ class IPMIService(CRUDService):
         Int('seconds'),
         Bool('force'),
     ))
+    @returns()
     async def identify(self, options):
         """
         Turn on IPMI chassis identify light.
@@ -171,6 +183,25 @@ class IPMIService(CRUDService):
         else:
             cmd = str(options.get('seconds'))
         await run('ipmitool', 'chassis', 'identify', cmd)
+
+    # TODO: Document me as well please
+    @filterable
+    async def query_sel(self, filters, options):
+        """
+        Query IPMI System Event Log
+        """
+        return filter_list([
+            record._asdict()
+            for record in parse_ipmitool_output(await run('ipmitool', '-c', 'sel', 'elist'))
+        ], filters, options)
+
+    @accepts()
+    @returns()
+    async def clear_sel(self):
+        """
+        Clear IPMI System Event Log
+        """
+        await run('ipmitool', 'sel', 'clear')
 
 
 async def setup(middleware):

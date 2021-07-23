@@ -1,4 +1,4 @@
-from middlewared.schema import Bool, Dict, Str, accepts
+from middlewared.schema import accepts, Bool, Datetime, Dict, Int, returns, Str
 from middlewared.service import (
     CallError, CRUDService, ValidationErrors, filterable, item_method, job
 )
@@ -22,6 +22,21 @@ class BootEnvService(CRUDService):
         cli_namespace = 'system.bootenv'
 
     BE_TOOL = 'zectl' if osc.IS_LINUX else 'beadm'
+    ENTRY = Dict(
+        'bootenv_entry',
+        Str('id'),
+        Str('realname'),
+        Str('name'),
+        Str('active'),
+        Bool('activated'),
+        Bool('can_activate'),
+        Str('mountpoint'),
+        Str('space'),
+        Datetime('created'),
+        Bool('keep'),
+        Int('rawspace'),
+        additional_attrs=True
+    )
 
     @filterable
     def query(self, filters, options):
@@ -33,7 +48,7 @@ class BootEnvService(CRUDService):
         cp = subprocess.run([self.BE_TOOL, 'list', '-H'], capture_output=True, text=True)
         datasets_origins = [
             d['properties']['origin']['parsed']
-            for d in self.middleware.call_sync('zfs.dataset.query')
+            for d in self.middleware.call_sync('zfs.dataset.query', [], {'extra': {'properties': ['origin']}})
         ]
         boot_pool = self.middleware.call_sync('boot.pool_name')
         for line in cp.stdout.strip().split('\n'):
@@ -51,7 +66,7 @@ class BootEnvService(CRUDService):
                 'mountpoint': fields[2],
                 'space': None if osc.IS_LINUX else fields[3],
                 'created': datetime.strptime(fields[3 if osc.IS_LINUX else 4], '%Y-%m-%d %H:%M'),
-                'keep': None,
+                'keep': False,
                 'rawspace': None
             }
 
@@ -98,7 +113,9 @@ class BootEnvService(CRUDService):
                 children = False
                 for snap in ds['snapshots']:
                     if snap['name'] not in datasets_origins:
-                        be['rawspace'] += snap['properties']['used']['parsed']
+                        be['rawspace'] += self.middleware.call_sync(
+                            'zfs.snapshot.query', [['id', '=', snap['name']]], {'extra': {'properties': ['used']}}
+                        )['properties']['used']['parsed']
                     else:
                         children = True
 
@@ -139,6 +156,7 @@ class BootEnvService(CRUDService):
 
     @item_method
     @accepts(Str('id'))
+    @returns(Bool('successfully_activated'))
     def activate(self, oid):
         """
         Activates boot environment `id`.
@@ -162,6 +180,7 @@ class BootEnvService(CRUDService):
             Bool('keep', default=False),
         )
     )
+    @returns(Bool('successfully_set_attribute'))
     async def set_attribute(self, oid, attrs):
         """
         Sets attributes boot environment `id`.
@@ -184,6 +203,7 @@ class BootEnvService(CRUDService):
         Str('name', required=True, validators=[Match(RE_BE_NAME)]),
         Str('source'),
     ))
+    @returns(Str('bootenv_name'))
     async def do_create(self, data):
         """
         Create a new boot environment using `name`.
@@ -216,11 +236,12 @@ class BootEnvService(CRUDService):
         'bootenv_update',
         Str('name', required=True, validators=[Match(RE_BE_NAME)]),
     ))
+    @returns(Str('bootenv_name'))
     async def do_update(self, oid, data):
         """
         Update `id` boot environment name with a new provided valid `name`.
         """
-        be = await self._get_instance(oid)
+        await self._get_instance(oid)
 
         verrors = ValidationErrors()
         await self._clean_be_name(verrors, 'bootenv_update', data['name'])

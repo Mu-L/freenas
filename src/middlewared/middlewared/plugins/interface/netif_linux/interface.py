@@ -1,6 +1,6 @@
-# -*- coding=utf-8 -*-
 import logging
 import subprocess
+from pyroute2 import NDB
 
 from .address import AddressFamily, AddressMixin
 from .bridge import BridgeMixin
@@ -141,8 +141,10 @@ class Interface(AddressMixin, BridgeMixin, LaggMixin, VlanMixin, VrrpMixin):
 
         if self.name.startswith('bond'):
             state.update({
-                'protocol': self.protocol.name,
-                'ports': [{'name': p, 'flags': [x.name for x in f]} for p, f in self.ports]
+                'protocol': self.protocol.name if self.protocol is not None else self.protocol,
+                'ports': [{'name': p, 'flags': [x.name for x in f]} for p, f in self.ports],
+                'xmit_hash_policy': self.xmit_hash_policy,
+                'lacpdu_rate': self.lacpdu_rate,
             })
 
         if self.name.startswith('vlan'):
@@ -155,7 +157,13 @@ class Interface(AddressMixin, BridgeMixin, LaggMixin, VlanMixin, VrrpMixin):
         return state
 
     def up(self):
-        run(["ip", "link", "set", self.name, "up"])
+        with NDB(log='off') as ndb:
+            with ndb.interfaces[self.name] as dev:
+                # this context manager waits until the interface
+                # is up and "ready" before exiting
+                dev['state'] = 'up'
 
     def down(self):
-        run(["ip", "link", "set", self.name, "down"])
+        with NDB(log='off') as ndb:
+            with ndb.interfaces[self.name] as dev:
+                dev['state'] = 'down'

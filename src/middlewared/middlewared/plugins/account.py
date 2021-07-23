@@ -1,4 +1,4 @@
-from middlewared.schema import accepts, Any, Bool, Dict, Int, List, Patch, Str
+from middlewared.schema import accepts, Any, Bool, Dict, Int, List, Patch, returns, Str
 from middlewared.service import (
     CallError, CRUDService, ValidationErrors, item_method, no_auth_required, pass_app, private, filterable, job
 )
@@ -22,7 +22,7 @@ import stat
 import time
 from pathlib import Path
 
-SKEL_PATH = '/usr/share/skel/'
+SKEL_PATH = '/etc/skel/'
 
 
 def pw_checkname(verrors, attribute, name):
@@ -102,7 +102,7 @@ class UserModel(sa.Model):
 
     id = sa.Column(sa.Integer(), primary_key=True)
     bsdusr_uid = sa.Column(sa.Integer())
-    bsdusr_username = sa.Column(sa.String(16), default='User &')
+    bsdusr_username = sa.Column(sa.String(16), default='User &', unique=True)
     bsdusr_unixhash = sa.Column(sa.String(128), default='*')
     bsdusr_smbhash = sa.Column(sa.EncryptedText(), default='*')
     bsdusr_home = sa.Column(sa.String(255), default="/nonexistent")
@@ -131,6 +131,22 @@ class UserService(CRUDService):
         datastore_extend = 'user.user_extend'
         datastore_prefix = 'bsdusr_'
         cli_namespace = 'account.user'
+
+    # FIXME: Please see if dscache can potentially alter result(s) format, without ad, it doesn't seem to
+    ENTRY = Patch(
+        'user_create', 'user_entry',
+        ('rm', {'name': 'group'}),
+        ('rm', {'name': 'group_create'}),
+        ('rm', {'name': 'home_mode'}),
+        ('rm', {'name': 'password'}),
+        ('add', Dict('group', additional_attrs=True)),
+        ('add', Int('id')),
+        ('add', Bool('builtin')),
+        ('add', Bool('id_type_both')),
+        ('add', Bool('local')),
+        ('add', Str('unixhash')),
+        ('add', Str('smbhash')),
+    )
 
     @private
     async def user_extend(self, user):
@@ -223,6 +239,7 @@ class UserService(CRUDService):
         Dict('attributes', additional_attrs=True),
         register=True,
     ))
+    @returns(Int('primary_key'))
     async def do_create(self, data):
         """
         Create a new user.
@@ -392,6 +409,7 @@ class UserService(CRUDService):
             ('rm', {'name': 'group_create'}),
         ),
     )
+    @returns(Int('primary_key'))
     async def do_update(self, pk, data):
         """
         Update attributes of an existing user.
@@ -553,6 +571,7 @@ class UserService(CRUDService):
         return pk
 
     @accepts(Int('id'), Dict('options', Bool('delete_group', default=True)))
+    @returns(Int('primary_key'))
     async def do_delete(self, pk, options):
         """
         Delete user `id`.
@@ -591,6 +610,13 @@ class UserService(CRUDService):
         return pk
 
     @accepts(Int('user_id', default=None, null=True))
+    @returns(Dict(
+        additional_attrs=True,
+        example={
+            '/usr/bin/sh': 'sh',
+            '/usr/bin/zsh': 'zsh',
+        }
+    ))
     def shell_choices(self, user_id):
         """
         Return the available shell choices to be used in `user.create` and `user.update`.
@@ -617,11 +643,24 @@ class UserService(CRUDService):
         Str('username', default=None),
         Int('uid', default=None)
     ))
+    @returns(Dict(
+        'user_information',
+        Str('pw_name'),
+        Str('pw_gecos'),
+        Str('pw_dir'),
+        Str('pw_shell'),
+        Int('pw_uid'),
+        Int('pw_gid'),
+    ))
     async def get_user_obj(self, data):
         """
         Returns dictionary containing information from struct passwd for the user specified by either
         the username or uid. Bypasses user cache.
         """
+        verrors = ValidationErrors()
+        if not data['username'] and data['uid'] is None:
+            verrors.add('get_user_obj.username', 'Either "username" or "uid" must be specified')
+        verrors.check()
         return await self.middleware.call('dscache.get_uncached_user', data['username'], data['uid'])
 
     @item_method
@@ -630,6 +669,7 @@ class UserService(CRUDService):
         Str('key'),
         Any('value'),
     )
+    @returns(Bool())
     async def set_attribute(self, pk, key, value):
         """
         Set user general purpose `attributes` dictionary `key` to `value`.
@@ -655,6 +695,7 @@ class UserService(CRUDService):
         Int('id'),
         Str('key'),
     )
+    @returns(Bool())
     async def pop_attribute(self, pk, key):
         """
         Remove user general purpose `attributes` dictionary `key`.
@@ -676,6 +717,7 @@ class UserService(CRUDService):
             return False
 
     @accepts()
+    @returns(Int('next_available_uid'))
     async def get_next_uid(self):
         """
         Get the next available/free uid.
@@ -694,6 +736,7 @@ class UserService(CRUDService):
 
     @no_auth_required
     @accepts()
+    @returns(Bool())
     async def has_root_password(self):
         """
         Return whether the root user has a valid password set.
@@ -717,6 +760,7 @@ class UserService(CRUDService):
             update=True,
         )
     )
+    @returns()
     @pass_app()
     async def set_root_password(self, app, password, options):
         """
@@ -987,7 +1031,7 @@ class GroupModel(sa.Model):
 
     id = sa.Column(sa.Integer(), primary_key=True)
     bsdgrp_gid = sa.Column(sa.Integer())
-    bsdgrp_group = sa.Column(sa.String(120))
+    bsdgrp_group = sa.Column(sa.String(120), unique=True)
     bsdgrp_builtin = sa.Column(sa.Boolean(), default=False)
     bsdgrp_sudo = sa.Column(sa.Boolean(), default=False)
     bsdgrp_sudo_nopasswd = sa.Column(sa.Boolean())
@@ -1011,19 +1055,45 @@ class GroupService(CRUDService):
         datastore_extend = 'group.group_extend'
         cli_namespace = 'account.group'
 
+    ENTRY = Patch(
+        'group_create', 'group_entry',
+        ('rm', {'name': 'allow_duplicate_gid'}),
+        ('add', Int('id')),
+        ('add', Str('group')),
+        ('add', Bool('builtin')),
+        ('add', Bool('id_type_both')),
+        ('add', Bool('local')),
+    )
+
     @private
     async def group_extend(self, group):
+        group['name'] = group['group']
         # Get group membership
-        group['users'] = [gm['user']['id'] for gm in await self.middleware.call('datastore.query', 'account.bsdgroupmembership', [('group', '=', group['id'])], {'prefix': 'bsdgrpmember_'})]
-        group['users'] += [gmu['id'] for gmu in await self.middleware.call('datastore.query', 'account.bsdusers', [('bsdusr_group_id', '=', group['id'])])]
+        group['users'] = [
+            gm['user']['id']
+            for gm in await self.middleware.call(
+                'datastore.query',
+                'account.bsdgroupmembership',
+                [('group', '=', group['id'])],
+                {'prefix': 'bsdgrpmember_'}
+            )
+        ]
+        group['users'] += [
+            gmu['id']
+            for gmu in await self.middleware.call(
+                'datastore.query',
+                'account.bsdusers',
+                [('bsdusr_group_id', '=', group['id'])]
+            )
+            if gmu['id'] not in group['users']
+        ]
         return group
 
     @private
     async def group_compress(self, group):
-        if 'local' in group:
-            group.pop('local')
-        if 'id_type_both' in group:
-            group.pop('id_type_both')
+        group.pop('name', None)
+        group.pop('local', None)
+        group.pop('id_type_both', None)
         return group
 
     @filterable
@@ -1076,6 +1146,7 @@ class GroupService(CRUDService):
         List('users', items=[Int('id')], required=False),
         register=True,
     ))
+    @returns(Int('primary_key'))
     async def do_create(self, data):
         """
         Create a new group.
@@ -1093,7 +1164,6 @@ class GroupService(CRUDService):
     @private
     async def create_internal(self, data, reload_users=True):
 
-        allow_duplicate_gid = data['allow_duplicate_gid']
         verrors = ValidationErrors()
         await self.__common_validation(verrors, data, 'group_create')
         verrors.check()
@@ -1116,18 +1186,7 @@ class GroupService(CRUDService):
             await self.middleware.call('service.reload', 'user')
 
         if data['smb']:
-            try:
-                await self.middleware.call('smb.groupmap_add', data['name'])
-            except Exception:
-                """
-                Samba's group mapping database does not allow duplicate gids.
-                Unfortunately, we don't get a useful error message at -d 0.
-                """
-                if not allow_duplicate_gid:
-                    raise
-                else:
-                    self.logger.debug('Refusing to generate duplicate gid mapping in group_mapping.tdb: %s -> %s',
-                                      data['name'], data['gid'])
+            await self.middleware.call('smb.synchronize_group_mappings')
 
         return pk
 
@@ -1139,13 +1198,14 @@ class GroupService(CRUDService):
             ('attr', {'update': True}),
         ),
     )
+    @returns(Int('primary_key'))
     async def do_update(self, pk, data):
         """
         Update attributes of an existing group.
         """
 
         group = await self._get_instance(pk)
-        add_groupmap = False
+        groupmap_changed = False
 
         verrors = ValidationErrors()
         await self.__common_validation(verrors, data, 'group_update', pk=pk)
@@ -1157,47 +1217,57 @@ class GroupService(CRUDService):
         new_smb = group['smb']
 
         if 'name' in data and data['name'] != group['group']:
-            if g := (await self.middleware.call('smb.groupmap_list')).get(group['group']):
-                await self.middleware.call(
-                    'smb.groupmap_delete',
-                    {"sid": g['SID']}
-                )
-
             group['group'] = group.pop('name')
             if new_smb:
-                add_groupmap = True
+                groupmap_changed = True
         else:
             group.pop('name', None)
             if new_smb and not old_smb:
-                add_groupmap = True
+                groupmap_changed = True
             elif old_smb and not new_smb:
-                await self.middleware.call('smb.groupmap_delete', {"ntgroup": group['group']})
+                groupmap_changed = True
 
         group = await self.group_compress(group)
         await self.middleware.call('datastore.update', 'account.bsdgroups', pk, group, {'prefix': 'bsdgrp_'})
 
         if 'users' in data:
-            existing = {i['bsdgrpmember_user']['id']: i for i in await self.middleware.call('datastore.query', 'account.bsdgroupmembership', [('bsdgrpmember_group', '=', pk)])}
+            primary_users = {
+                u['id']
+                for u in await self.middleware.call(
+                    'datastore.query',
+                    'account.bsdusers',
+                    [('bsdusr_group', '=', pk)],
+                )
+            }
+            existing = {
+                i['bsdgrpmember_user']['id']: i
+                for i in await self.middleware.call(
+                    'datastore.query',
+                    'account.bsdgroupmembership',
+                    [('bsdgrpmember_group', '=', pk)]
+                )
+            }
             to_remove = set(existing.keys()) - set(data['users'])
             for i in to_remove:
                 await self.middleware.call('datastore.delete', 'account.bsdgroupmembership', existing[i]['id'])
 
-            to_add = set(data['users']) - set(existing.keys())
+            to_add = set(data['users']) - set(existing.keys()) - primary_users
             for i in to_add:
-                await self.middleware.call('datastore.insert', 'account.bsdgroupmembership', {'bsdgrpmember_group': pk, 'bsdgrpmember_user': i})
+                await self.middleware.call(
+                    'datastore.insert',
+                    'account.bsdgroupmembership',
+                    {'bsdgrpmember_group': pk, 'bsdgrpmember_user': i},
+                )
 
         await self.middleware.call('service.reload', 'user')
 
-        """
-        "net groupmap" checks for existence of group prior to creating new groupmaps. This section
-        must occur after user reload.
-        """
-        if add_groupmap:
-            await self.middleware.call('smb.groupmap_add', group['group'])
+        if groupmap_changed:
+            await self.middleware.call('smb.synchronize_group_mappings')
 
         return pk
 
     @accepts(Int('id'), Dict('options', Bool('delete_users', default=False)))
+    @returns(Int('primary_key'))
     async def do_delete(self, pk, options):
         """
         Delete group `id`.
@@ -1206,8 +1276,8 @@ class GroupService(CRUDService):
         """
 
         group = await self._get_instance(pk)
-        if group['smb'] and (g := (await self.middleware.call('smb.groupmap_list')).get(group['group'])):
-            await self.middleware.call('smb.groupmap_delete', {"sid": g['SID']})
+        if group['smb']:
+            await self.middleware.call('smb.synchronize_group_mappings')
 
         if group['builtin']:
             raise CallError('A built-in group cannot be deleted.', errno.EACCES)
@@ -1228,6 +1298,8 @@ class GroupService(CRUDService):
 
         return pk
 
+    @accepts()
+    @returns(Int('next_available_gid'))
     async def get_next_gid(self):
         """
         Get the next available/free gid.
@@ -1249,11 +1321,21 @@ class GroupService(CRUDService):
         Str('groupname', default=None),
         Int('gid', default=None)
     ))
+    @returns(Dict(
+        'group_info',
+        Str('gr_name'),
+        Int('gr_gid'),
+        List('gr_mem'),
+    ))
     async def get_group_obj(self, data):
         """
         Returns dictionary containing information from struct grp for the group specified by either
         the groupname or gid. Bypasses group cache.
         """
+        verrors = ValidationErrors()
+        if not data['groupname'] and data['gid'] is None:
+            verrors.add('get_group_obj.groupname', 'Either "groupname" or "gid" must be specified')
+        verrors.check()
         return await self.middleware.call('dscache.get_uncached_group', data['groupname'], data['gid'])
 
     async def __common_validation(self, verrors, data, schema, pk=None):
@@ -1305,12 +1387,35 @@ class GroupService(CRUDService):
                 )
 
         if 'users' in data:
-            existing = set([i['id'] for i in await self.middleware.call('datastore.query', 'account.bsdusers', [('id', 'in', data['users'])])])
+            existing = {
+                i['id']
+                for i in await self.middleware.call(
+                    'datastore.query',
+                    'account.bsdusers',
+                    [('id', 'in', data['users'])],
+                )
+            }
             notfound = set(data['users']) - existing
             if notfound:
                 verrors.add(
                     f'{schema}.users',
                     f'Following users do not exist: {", ".join(map(str, notfound))}',
+                )
+
+            primary_users = await self.middleware.call(
+                'datastore.query',
+                'account.bsdusers',
+                [('bsdusr_group', '=', pk)],
+            )
+            notfound = []
+            for user in primary_users:
+                if user['id'] not in data['users']:
+                    notfound.append(user['bsdusr_username'])
+            if notfound:
+                verrors.add(
+                    f'{schema}.users',
+                    f'This group is primary for the following users: {", ".join(map(str, notfound))}. '
+                    'You can\'t remove them.',
                 )
 
         if 'sudo_commands' in data:

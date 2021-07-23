@@ -9,11 +9,11 @@ import tempfile
 
 from pkg_resources import parse_version
 
-from middlewared.schema import Bool, Dict, Str
+from middlewared.schema import Bool, Dict, Ref, Str, returns
 from middlewared.service import accepts, CallError, job, periodic, private, Service, ValidationErrors
 
 from .schema import clean_values_for_upgrade
-from .utils import CONTEXT_KEY_NAME, get_action_context
+from .utils import CONTEXT_KEY_NAME, get_action_context, SCALEABLE_RESOURCES, SCALE_DOWN_ANNOTATION
 
 
 class ChartReleaseService(Service):
@@ -21,15 +21,47 @@ class ChartReleaseService(Service):
     class Config:
         namespace = 'chart.release'
 
+    @private
+    async def scale_down_workloads_before_snapshot(self, job, release):
+        resources = []
+        pod_mapping = await self.middleware.call('chart.release.get_workload_to_pod_mapping', release['namespace'])
+        pods_to_watch_for = []
+        for resource in SCALEABLE_RESOURCES:
+            for workload in await self.middleware.call(
+                f'k8s.{resource.name.lower()}.query', [
+                    [f'metadata.annotations.{SCALE_DOWN_ANNOTATION["key"]}', 'in',
+                     SCALE_DOWN_ANNOTATION['value']],
+                    ['metadata.namespace', '=', release['namespace']],
+                ]
+            ):
+                resources.append({
+                    'replica_count': 0,
+                    'type': resource.name,
+                    'name': workload['metadata']['name'],
+                })
+                pods_to_watch_for.extend(pod_mapping[workload['metadata']['uid']])
+
+        if not resources:
+            return
+
+        job.set_progress(35, f'Scaling down {", ".join([r["name"] for r in resources])} workload(s)')
+        await self.middleware.call('chart.release.scale_workloads', release['id'], resources)
+        await self.middleware.call(
+            'chart.release.wait_for_pods_to_terminate', release['namespace'], [
+                ['metadata.name', 'in', pods_to_watch_for],
+            ]
+        )
+        job.set_progress(40, 'Successfully scaled down workload(s)')
+
     @accepts(
         Str('release_name'),
         Dict(
             'upgrade_options',
-            Bool('update_container_images', default=True),
             Dict('values', additional_attrs=True),
             Str('item_version', default='latest'),
         )
     )
+    @returns(Ref('chart_release_entry'))
     @job(lock=lambda args: f'chart_release_upgrade_{args[0]}')
     async def upgrade(self, job, release_name, options):
         """
@@ -37,9 +69,7 @@ class ChartReleaseService(Service):
 
         `upgrade_options.item_version` specifies to which item version chart release should be upgraded to.
 
-        System will update container images being used by `release_name` chart release. This can be controlled
-        right now by `upgrade_options.update_container_images` option but this is deprecated and will be removed
-        in the future where system will always update container images in use by a chart release as a chart release
+        System will update container images being used by `release_name` chart release as a chart release
         upgrade is not considered complete until the images in use have also been updated to latest versions.
 
         During upgrade, `upgrade_options.values` can be specified to apply configuration changes for configuration
@@ -55,15 +85,14 @@ class ChartReleaseService(Service):
 
         # We need to update container images before upgrading chart version as it's possible that the chart version
         # in question needs newer image hashes.
-        if options['update_container_images']:
-            # TODO: Always do this in the future
-            job.set_progress(10, 'Updating container images')
-            await (
-                await self.middleware.call('chart.release.pull_container_images', release_name, {'redeploy': False})
-            ).wait(raise_error=True)
-            job.set_progress(30, 'Updated container images')
+        job.set_progress(10, 'Updating container images')
+        await (
+            await self.middleware.call('chart.release.pull_container_images', release_name, {'redeploy': False})
+        ).wait(raise_error=True)
+        job.set_progress(30, 'Updated container images')
 
-        job.set_progress(40, 'Created snapshot for upgrade')
+        await self.scale_down_workloads_before_snapshot(job, release)
+
         # If a snapshot of the volumes already exist with the same name in case of a failed upgrade, we will remove
         # it as we want the current point in time being reflected in the snapshot
         # TODO: Remove volumes/ix_volumes check in next release as we are going to do a recursive snapshot
@@ -79,6 +108,7 @@ class ChartReleaseService(Service):
                 'dataset': os.path.join(release['dataset'], 'volumes'), 'name': release['version'], 'recursive': True
             }
         )
+        job.set_progress(50, 'Created snapshot for upgrade')
 
         if release['update_available']:
             await self.upgrade_chart_release(job, release, options)
@@ -101,6 +131,15 @@ class ChartReleaseService(Service):
             Str('item_version', default='latest', empty=False)
         )
     )
+    @returns(Dict(
+        Dict(
+            'container_images_to_update', additional_attrs=True,
+            description='Dictionary of container image(s) which have an update available against the same tag',
+        ),
+        Str('latest_version'),
+        Str('latest_human_version'),
+        Str('changelog', max_length=None, null=True),
+    ))
     def upgrade_summary(self, release_name, options):
         """
         Retrieve upgrade summary for `release_name` which will include which container images will be updated
@@ -135,35 +174,20 @@ class ChartReleaseService(Service):
 
     @private
     async def get_version(self, release, options):
-        catalog = await self.middleware.call(
-            'catalog.query', [['id', '=', release['catalog']]], {'extra': {'item_details': True}},
-        )
-        if not catalog:
-            raise CallError(f'Unable to locate {release["catalog"]!r} catalog', errno=errno.ENOENT)
-        else:
-            catalog = catalog[0]
-
         current_chart = release['chart_metadata']
         chart = current_chart['name']
-        if release['catalog_train'] not in catalog['trains']:
-            raise CallError(
-                f'Unable to locate {release["catalog_train"]!r} catalog train in {release["catalog"]!r}',
-                errno=errno.ENOENT,
-            )
-        if chart not in catalog['trains'][release['catalog_train']]:
-            raise CallError(
-                f'Unable to locate {chart!r} catalog item in {release["catalog"]!r} '
-                f'catalog\'s {release["catalog_train"]!r} train.', errno=errno.ENOENT
-            )
+        item_details = await self.middleware.call('catalog.get_item_details', chart, {
+            'catalog': release['catalog'],
+            'train': release['catalog_train'],
+        })
 
         new_version = options['item_version']
         if new_version == 'latest':
             new_version = await self.middleware.call(
-                'chart.release.get_latest_version_from_item_versions',
-                catalog['trains'][release['catalog_train']][chart]['versions']
+                'chart.release.get_latest_version_from_item_versions', item_details['versions']
             )
 
-        if new_version not in catalog['trains'][release['catalog_train']][chart]['versions']:
+        if new_version not in item_details['versions']:
             raise CallError(f'Unable to locate specified {new_version!r} item version.')
 
         verrors = ValidationErrors()
@@ -175,16 +199,18 @@ class ChartReleaseService(Service):
 
         verrors.check()
 
-        return catalog['trains'][release['catalog_train']][chart]['versions'][new_version]
+        return item_details['versions'][new_version]
 
     @private
     async def upgrade_chart_release(self, job, release, options):
+        release_orig = copy.deepcopy(release)
         release_name = release['name']
 
         catalog_item = await self.get_version(release, options)
         await self.middleware.call('catalog.version_supported_error_check', catalog_item)
 
         config = await self.middleware.call('chart.release.upgrade_values', release, catalog_item['location'])
+        release_orig['config'] = config
 
         # We will be performing validation for values specified. Why we want to allow user to specify values here
         # is because the upgraded catalog item version might have different schema which potentially means that
@@ -198,6 +224,7 @@ class ChartReleaseService(Service):
 
         config, context = await self.middleware.call(
             'chart.release.normalise_and_validate_values', catalog_item, config, False, release['dataset'],
+            release_orig,
         )
         job.set_progress(50, 'Initial validation complete for upgrading chart version')
 
@@ -295,14 +322,11 @@ class ChartReleaseService(Service):
 
     @private
     async def chart_release_update_check(self, catalog_item, application):
-        available_versions = [
-            parse_version(version) for version, data in catalog_item['versions'].items() if data['healthy']
-        ]
-        if not available_versions:
+        latest_version = catalog_item['latest_version']
+        if not latest_version:
             return
 
-        available_versions.sort(reverse=True)
-        if available_versions[0] > parse_version(application['chart_metadata']['version']):
+        if parse_version(latest_version) > parse_version(application['chart_metadata']['version']):
             await self.middleware.call('alert.oneshot_create', 'ChartReleaseUpdate', application)
         else:
             await self.middleware.call('alert.oneshot_delete', 'ChartReleaseUpdate', application['id'])
@@ -314,6 +338,13 @@ class ChartReleaseService(Service):
             Bool('redeploy', default=True),
         )
     )
+    @returns(Dict(
+        'container_images', additional_attrs=True,
+        description='Dictionary of container image(s) with container image tag as key and update status as value',
+        example={
+            'plexinc/pms-docker:1.23.2.4656-85f0adf5b': 'Updated image',
+        }
+    ))
     @job(lock=lambda args: f'pull_container_images{args[0]}')
     async def pull_container_images(self, job, release_name, options):
         """
@@ -324,7 +355,7 @@ class ChartReleaseService(Service):
         """
         await self.middleware.call('kubernetes.validate_k8s_setup')
         images = [
-            {'orig_tag': tag, **(await self.middleware.call('container.image.parse_image_tag', tag))}
+            {'orig_tag': tag, 'from_image': tag.rsplit(':', 1)[0], 'tag': tag.rsplit(':', 1)[-1]}
             for tag in (await self.middleware.call(
                 'chart.release.query', [['id', '=', release_name]],
                 {'extra': {'retrieve_resources': True}, 'get': True}
@@ -334,7 +365,7 @@ class ChartReleaseService(Service):
 
         bulk_job = await self.middleware.call(
             'core.bulk', 'container.image.pull', [
-                [{'from_image': f'{image["registry"]}/{image["image"]}', 'tag': image['tag']}]
+                [{'from_image': image['from_image'], 'tag': image['tag']}]
                 for image in images
             ]
         )

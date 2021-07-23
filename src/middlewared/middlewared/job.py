@@ -1,10 +1,12 @@
 import asyncio
+import contextlib
 from collections import OrderedDict
 import copy
 from datetime import datetime
 import enum
 import logging
 import os
+import shutil
 import sys
 import time
 import traceback
@@ -14,6 +16,8 @@ from middlewared.service_exception import CallError, ValidationError, Validation
 from middlewared.pipe import Pipes
 
 logger = logging.getLogger(__name__)
+
+LOGS_DIR = '/var/log/jobs'
 
 
 class State(enum.Enum):
@@ -180,6 +184,8 @@ class JobsDeque(object):
         self.maxlen = maxlen
         self.count = 0
         self.__dict = OrderedDict()
+        with contextlib.suppress(FileNotFoundError):
+            shutil.rmtree(LOGS_DIR)
 
     def __getitem__(self, item):
         return self.__dict[item]
@@ -362,10 +368,8 @@ class Job(object):
         """
 
         if self.options["logs"]:
-            logs_dir = os.path.join("/tmp/middlewared/jobs")
-            os.makedirs(logs_dir, exist_ok=True)
-            self.logs_path = os.path.join(logs_dir, f"{self.id}.log")
-            self.logs_fd = open(self.logs_path, "wb", buffering=0)
+            self.logs_path = os.path.join(LOGS_DIR, f"{self.id}.log")
+            self.start_logging()
 
         try:
             if self.aborted:
@@ -515,6 +519,23 @@ class Job(object):
                 os.unlink(self.logs_path)
             except Exception:
                 pass
+
+    def stop_logging(self):
+        fd = self.logs_fd
+        if fd is not None:
+            # This is only for a short amount of time when moving system dataset
+            # We could use io.BytesIO() for a temporary buffer but if a bad job produces lots of logs
+            # and system dataset move crashes, we don't want these logs to clog up the RAM.
+            self.logs_fd = open('/dev/null', 'wb')
+            fd.close()
+
+    def start_logging(self):
+        if self.logs_path is not None:
+            fd = self.logs_fd
+            os.makedirs(LOGS_DIR, exist_ok=True)
+            self.logs_fd = open(self.logs_path, 'ab', buffering=0)
+            if fd is not None:
+                fd.close()
 
 
 class JobProgressBuffer:

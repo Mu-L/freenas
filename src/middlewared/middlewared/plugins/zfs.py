@@ -1,3 +1,4 @@
+import copy
 import errno
 import subprocess
 import threading
@@ -7,12 +8,12 @@ from copy import deepcopy
 
 import libzfs
 
-from middlewared.schema import Any, Dict, Int, List, Str, Bool, accepts
+from middlewared.schema import accepts, Any, Bool, Dict, Int, List, Str
 from middlewared.service import (
     CallError, CRUDService, ValidationError, ValidationErrors, filterable, job, private,
 )
-from middlewared.utils import filter_list, filter_getattrs, osc
-from middlewared.validators import ReplicationSnapshotNamingSchema
+from middlewared.utils import filter_list, filter_getattrs
+from middlewared.validators import Match, ReplicationSnapshotNamingSchema
 
 
 class ZFSSetPropertyError(CallError):
@@ -128,6 +129,8 @@ class ZFSPoolService(CRUDService):
                         prop.parsed = v['parsed']
         except libzfs.ZFSException as e:
             raise CallError(str(e))
+        else:
+            return options
 
     @accepts(Str('pool'), Dict(
         'options',
@@ -142,6 +145,8 @@ class ZFSPoolService(CRUDService):
             if e.code == libzfs.Error.UMOUNTFAILED:
                 errno_ = errno.EBUSY
             raise CallError(str(e), errno_)
+        else:
+            return True
 
     @accepts(Str('pool', required=True))
     def upgrade(self, pool):
@@ -369,7 +374,7 @@ class ZFSPoolService(CRUDService):
         found = False
         with libzfs.ZFS() as zfs:
             for pool in zfs.find_import(
-                cachefile=cachefile, search_paths=['/dev/disk/by-partuuid'] if osc.IS_LINUX else None
+                cachefile=cachefile, search_paths=['/dev/disk/by-partuuid', '/dev']
             ):
                 if pool.name == name_or_guid or str(pool.guid) == name_or_guid:
                     found = pool
@@ -483,8 +488,7 @@ class ZFSDatasetService(CRUDService):
         datasets which does not incur the performance penalty.
 
         `query-options.extra.properties` is a list of properties which should be retrieved. If null ( by default ),
-        it would retrieve all properties, if empty, it will retrieve no property ( `mountpoint` is special in this
-        case and is controlled by `query-options.extra.mountpoint` attribute ).
+        it would retrieve all properties, if empty, it will retrieve no property.
 
         We provide 2 ways how zfs.dataset.query returns dataset's data. First is a flat structure ( default ), which
         means that all the datasets in the system are returned as separate objects which also contain all the data
@@ -509,6 +513,8 @@ class ZFSDatasetService(CRUDService):
         retrieve_properties = extra.get('retrieve_properties', True)
         retrieve_children = extra.get('retrieve_children', True)
         snapshots = extra.get('snapshots')
+        snapshots_recursive = extra.get('snapshots_recursive')
+        snapshots_properties = extra.get('snapshots_properties', [])
         if not retrieve_properties:
             # This is a short hand version where consumer can specify that they don't want any property to
             # be retrieved
@@ -519,6 +525,7 @@ class ZFSDatasetService(CRUDService):
             # Handle `id` filter specially to avoiding getting all datasets
             kwargs = dict(
                 props=props, user_props=user_properties, snapshots=snapshots, retrieve_children=retrieve_children,
+                snapshots_recursive=snapshots_recursive, snapshot_props=snapshots_properties
             )
             if filters and filters[0][0] == 'id':
                 if filters[0][1] == '=':
@@ -718,7 +725,9 @@ class ZFSDatasetService(CRUDService):
     )
     def unload_key(self, id, options):
         force = options.pop('force_umount')
-        if options.pop('umount') and self.middleware.call_sync('zfs.dataset.get_instance', id)['mountpoint']:
+        if options.pop('umount') and self.middleware.call_sync(
+            'zfs.dataset.query', [['id', '=', id]], {'extra': {'retrieve_children': False}, 'get': True}
+        )['properties'].get('mountpoint', {}).get('value', 'none') != 'none':
             self.umount(id, {'force': force})
         try:
             with libzfs.ZFS() as zfs:
@@ -772,6 +781,7 @@ class ZFSDatasetService(CRUDService):
 
     @accepts(Dict(
         'dataset_create',
+        Bool('create_ancestors', default=False),
         Str('name', required=True),
         Str('type', enum=['FILESYSTEM', 'VOLUME'], default='FILESYSTEM'),
         Dict(
@@ -810,10 +820,15 @@ class ZFSDatasetService(CRUDService):
         try:
             with libzfs.ZFS() as zfs:
                 pool = zfs.get(data['name'].split('/')[0])
-                pool.create(data['name'], params, fstype=getattr(libzfs.DatasetType, data['type']), sparse_vol=sparse)
+                pool.create(
+                    data['name'], params, fstype=getattr(libzfs.DatasetType, data['type']),
+                    sparse_vol=sparse, create_ancestors=data['create_ancestors'],
+                )
         except libzfs.ZFSException as e:
             self.logger.error('Failed to create dataset', exc_info=True)
             raise CallError(f'Failed to create dataset: {e}')
+        else:
+            return data
 
     @accepts(
         Str('id'),
@@ -836,48 +851,51 @@ class ZFSDatasetService(CRUDService):
                     for k in ['quota', 'refquota']:
                         if k in properties:
                             properties[k] = properties.pop(k)  # Set them last
-                    for k, v in properties.items():
-
-                        # If prop already exists we just update it,
-                        # otherwise create a user property
-                        prop = dataset.properties.get(k)
-                        try:
-                            if prop:
-                                if v.get('source') == 'INHERIT':
-                                    prop.inherit(recursive=v.get('recursive', False))
-                                elif 'value' in v and (
-                                    prop.value != v['value'] or prop.source.name == 'INHERITED'
-                                ):
-                                    prop.value = v['value']
-                                elif 'parsed' in v and (
-                                    prop.parsed != v['parsed'] or prop.source.name == 'INHERITED'
-                                ):
-                                    prop.parsed = v['parsed']
-                            else:
-                                if v.get('source') == 'INHERIT':
-                                    pass
-                                else:
-                                    if 'value' not in v:
-                                        raise ValidationError(
-                                            'properties', f'properties.{k} needs a "value" attribute'
-                                        )
-                                    if ':' not in k:
-                                        raise ValidationError(
-                                            'properties', f'User property needs a colon (:) in its name`'
-                                        )
-                                    prop = libzfs.ZFSUserProperty(v['value'])
-                                    dataset.properties[k] = prop
-                        except libzfs.ZFSException as e:
-                            raise ZFSSetPropertyError(k, str(e))
+                    self.update_zfs_object_props(properties, dataset)
 
         except libzfs.ZFSException as e:
             self.logger.error('Failed to update dataset', exc_info=True)
             raise CallError(f'Failed to update dataset: {e}')
+        else:
+            return data
 
-    def do_delete(self, id, options=None):
-        options = options or {}
-        force = options.get('force', False)
-        recursive = options.get('recursive', False)
+    def update_zfs_object_props(self, properties, zfs_object):
+        for k, v in properties.items():
+            # If prop already exists we just update it,
+            # otherwise create a user property
+            prop = zfs_object.properties.get(k)
+            try:
+                if prop:
+                    if v.get('source') == 'INHERIT':
+                        prop.inherit(recursive=v.get('recursive', False))
+                    elif 'value' in v and (prop.value != v['value'] or prop.source.name == 'INHERITED'):
+                        prop.value = v['value']
+                    elif 'parsed' in v and (prop.parsed != v['parsed'] or prop.source.name == 'INHERITED'):
+                        prop.parsed = v['parsed']
+                else:
+                    if v.get('source') == 'INHERIT':
+                        pass
+                    else:
+                        if 'value' not in v:
+                            raise ValidationError('properties', f'properties.{k} needs a "value" attribute')
+                        if ':' not in k:
+                            raise ValidationError('properties', f'User property needs a colon (:) in its name`')
+                        prop = libzfs.ZFSUserProperty(v['value'])
+                        zfs_object.properties[k] = prop
+            except libzfs.ZFSException as e:
+                raise ZFSSetPropertyError(k, str(e))
+
+    @accepts(
+        Str('id'),
+        Dict(
+            'options',
+            Bool('force', default=False),
+            Bool('recursive', default=False),
+        )
+    )
+    def do_delete(self, id, options):
+        force = options['force']
+        recursive = options['recursive']
 
         args = []
         if force:
@@ -904,6 +922,7 @@ class ZFSDatasetService(CRUDService):
             if "Device busy" in error or "dataset is busy" in error:
                 errno_ = errno.EBUSY
             raise CallError(f'Failed to delete dataset: {error}', errno_)
+        return True
 
     @accepts(Str('name'), Dict('options', Bool('recursive', default=False)))
     def mount(self, name, options):
@@ -993,16 +1012,35 @@ class ZFSSnapshot(CRUDService):
                 return filter_list(snaps, filters, options)
             return snaps
 
+        extra = copy.deepcopy(options['extra'])
+        properties = extra.get('properties')
         with libzfs.ZFS() as zfs:
             # Handle `id` filter to avoid getting all snapshots first
-            kwargs = dict(holds=False, mounted=False)
-            if filters and len(filters) == 1 and list(filters[0][:2]) == ['id', '=']:
+            kwargs = dict(holds=False, mounted=False, props=properties)
+            if filters and len(filters) == 1 and len(filters[0]) == 3 and filters[0][0] in (
+                'id', 'name'
+            ) and filters[0][1] == '=':
                 kwargs['datasets'] = [filters[0][2]]
 
             snapshots = zfs.snapshots_serialized(**kwargs)
 
         # FIXME: awful performance with hundreds/thousands of snapshots
-        return filter_list(snapshots, filters, options)
+        select = options.pop('select', None)
+        result = filter_list(snapshots, filters, options)
+
+        if not select or 'retention' in select:
+            if isinstance(result, list):
+                result = self.middleware.call_sync('zettarepl.annotate_snapshots', result)
+            elif isinstance(result, dict):
+                result = self.middleware.call_sync('zettarepl.annotate_snapshots', [result])[0]
+
+        if select:
+            if isinstance(result, list):
+                result = [{k: v for k, v in item.items() if k in select} for item in result]
+            elif isinstance(result, dict):
+                result = {k: v for k, v in result.items() if k in select}
+
+        return result
 
     @accepts(Dict(
         'snapshot_create',
@@ -1060,6 +1098,41 @@ class ZFSSnapshot(CRUDService):
             if vmware_context:
                 self.middleware.call_sync('vmware.snapshot_end', vmware_context)
 
+    @accepts(
+        Str('id'), Dict(
+            'snapshot_update',
+            List(
+                'user_properties_update',
+                items=[Dict(
+                    'user_property',
+                    Str('key', required=True, validators=[Match(r'.*:.*')]),
+                    Str('value'),
+                    Bool('remove'),
+                )],
+            ),
+        )
+    )
+    def do_update(self, snap_id, data):
+        verrors = ValidationErrors()
+        props = data['user_properties_update']
+        for index, prop in enumerate(props):
+            if prop.get('remove') and 'value' in prop:
+                verrors.add(
+                    f'snapshot_update.user_properties_update.{index}.remove',
+                    'Must not be set when value is specified'
+                )
+        verrors.check()
+
+        try:
+            with libzfs.ZFS() as zfs:
+                snap = zfs.get_snapshot(snap_id)
+                user_props = self.middleware.call_sync('pool.dataset.get_create_update_user_props', props, True)
+                self.middleware.call_sync('zfs.dataset.update_zfs_object_props', user_props, snap)
+        except libzfs.ZFSException as e:
+            raise CallError(str(e))
+        else:
+            return self.middleware.call_sync('zfs.snapshot.get_instance', snap_id)
+
     @accepts(Dict(
         'snapshot_remove',
         Str('dataset', required=True),
@@ -1106,8 +1179,12 @@ class ZFSSnapshot(CRUDService):
 
     @accepts(Dict(
         'snapshot_clone',
-        Str('snapshot'),
-        Str('dataset_dst'),
+        Str('snapshot', required=True, empty=False),
+        Str('dataset_dst', required=True, empty=False),
+        Dict(
+            'dataset_properties',
+            additional_attrs=True,
+        )
     ))
     def clone(self, data):
         """
@@ -1119,14 +1196,12 @@ class ZFSSnapshot(CRUDService):
 
         snapshot = data.get('snapshot', '')
         dataset_dst = data.get('dataset_dst', '')
-
-        if not snapshot or not dataset_dst:
-            return False
+        props = data['dataset_properties']
 
         try:
             with libzfs.ZFS() as zfs:
                 snp = zfs.get_snapshot(snapshot)
-                snp.clone(dataset_dst)
+                snp.clone(dataset_dst, props)
                 dataset = zfs.get_dataset(dataset_dst)
                 if dataset.type.name == 'FILESYSTEM':
                     dataset.mount_recursive()

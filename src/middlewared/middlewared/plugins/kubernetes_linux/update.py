@@ -4,7 +4,7 @@ import itertools
 import middlewared.sqlalchemy as sa
 
 from middlewared.common.listen import ConfigServiceListenSingleDelegate
-from middlewared.schema import Bool, Dict, IPAddr, Str
+from middlewared.schema import Bool, Dict, Int, IPAddr, Patch, returns, Str
 from middlewared.service import accepts, CallError, job, private, ConfigService, ValidationErrors
 
 from .utils import applications_ds_name, MIGRATION_NAMING_SCHEMA
@@ -24,6 +24,7 @@ class KubernetesModel(sa.Model):
     route_v6_gateway = sa.Column(sa.String(128), nullable=True)
     node_ip = sa.Column(sa.String(128), default='0.0.0.0')
     cni_config = sa.Column(sa.JSON(type=dict), default={})
+    configure_gpus = sa.Column(sa.Boolean(), default=True, nullable=False)
 
 
 class KubernetesService(ConfigService):
@@ -32,6 +33,23 @@ class KubernetesService(ConfigService):
         datastore = 'services.kubernetes'
         datastore_extend = 'kubernetes.k8s_extend'
         cli_namespace = 'app.kubernetes'
+
+    ENTRY = Dict(
+        'kubernetes_entry',
+        Bool('configure_gpus', required=True),
+        Str('pool', required=True, null=True),
+        IPAddr('cluster_cidr', required=True, cidr=True, empty=True),
+        IPAddr('service_cidr', required=True, cidr=True, empty=True),
+        IPAddr('cluster_dns_ip', required=True, empty=True),
+        IPAddr('node_ip', required=True),
+        Str('route_v4_interface', required=True, null=True),
+        IPAddr('route_v4_gateway', required=True, null=True, v6=False),
+        Str('route_v6_interface', required=True, null=True),
+        IPAddr('route_v6_gateway', required=True, null=True, v4=False),
+        Str('dataset', required=True, null=True),
+        Int('id', required=True),
+        update=True,
+    )
 
     @private
     async def k8s_extend(self, data):
@@ -136,13 +154,11 @@ class KubernetesService(ConfigService):
             verrors.add(f'{schema}.node_ip', 'Please provide a valid IP address.')
 
         if not await self.middleware.call('route.configured_default_ipv4_route'):
-            if not data['route_v4_gateway']:
-                verrors.add(f'{schema}.route_v4_gateway', 'Please set a default route for system or for kubernetes.')
-            if not data['route_v4_interface']:
-                verrors.add(
-                    f'{schema}.route_v4_interface',
-                    'Please set a default route for system or specify default interface to be used for kubernetes.'
-                )
+            verrors.add(
+                f'{schema}.route_v4_interface',
+                'Please, set IPv4 Default Gateway (it can be fake) in Network → Global Configuration and then '
+                'update Kubernetes settings. Currently, k3s cannot be used without a default route.'
+            )
 
         for k, _ in await self.validate_interfaces(data):
             verrors.add(f'{schema}.{k}', 'Please specify a valid interface.')
@@ -167,20 +183,24 @@ class KubernetesService(ConfigService):
             errors.append((k, data[k]))
         return errors
 
+    @private
+    async def validate_config(self):
+        data = await self.middleware.call('kubernetes.config')
+        data.pop('id')
+        data.pop('dataset')
+
+        try:
+            await self.validate_data(data, 'kubernetes', data)
+        except ValidationErrors as e:
+            return e
+
     @accepts(
-        Dict(
-            'kubernetes_update',
-            Bool('migrate_applications'),
-            Str('pool', empty=False, null=True),
-            IPAddr('cluster_cidr', cidr=True, empty=True),
-            IPAddr('service_cidr', cidr=True, empty=True),
-            IPAddr('cluster_dns_ip', empty=True),
-            IPAddr('node_ip'),
-            Str('route_v4_interface', null=True),
-            IPAddr('route_v4_gateway', null=True, v6=False),
-            Str('route_v6_interface', null=True),
-            IPAddr('route_v6_gateway', null=True, v4=False),
-            update=True,
+        Patch(
+            'kubernetes_entry', 'kubernetes_update',
+            ('add', Bool('migrate_applications')),
+            ('rm', {'name': 'id'}),
+            ('rm', {'name': 'dataset'}),
+            ('attr', {'update': True}),
         )
     )
     @job(lock='kubernetes_update')
@@ -282,6 +302,7 @@ class KubernetesService(ConfigService):
                 await self.middleware.call('zfs.snapshot.delete', snap_name, {'recursive': True})
 
     @accepts()
+    @returns(Dict('kubernetes_bind_ip_choices', additional_attrs=True,))
     async def bindip_choices(self):
         """
         Returns ip choices for Kubernetes service to use.
@@ -301,17 +322,18 @@ class KubernetesService(ConfigService):
             raise CallError('Kubernetes service is not running.')
 
     @accepts()
+    @returns(Str('kubernetes_node_ip', null=True))
     async def node_ip(self):
         """
         Returns IP used by kubernetes which kubernetes uses to allow incoming connections.
         """
-        k8s_node_config = await self.middleware.call('k8s.node.config')
         node_ip = None
-        if k8s_node_config['node_configured']:
-            node_ip = next(
-                (addr['address'] for addr in k8s_node_config['status']['addresses'] if addr['type'] == 'InternalIP'),
-                None
-            )
+        if await self.middleware.call('service.started', 'kubernetes'):
+            k8s_node_config = await self.middleware.call('k8s.node.config')
+            if k8s_node_config['node_configured']:
+                node_ip = next((
+                    addr['address'] for addr in k8s_node_config['status']['addresses'] if addr['type'] == 'InternalIP'
+                ), None)
         if not node_ip:
             node_ip = (await self.middleware.call('kubernetes.config'))['node_ip']
 

@@ -1,7 +1,10 @@
 import asyncio
 import copy
+import functools
+import json
+import textwrap
 from collections import defaultdict
-from datetime import datetime, time
+from datetime import datetime, time, timedelta, timezone
 import errno
 import inspect
 import ipaddress
@@ -10,9 +13,24 @@ import os
 from croniter import croniter
 
 from middlewared.service_exception import ValidationErrors
+from middlewared.settings import conf
 from middlewared.utils import filter_list
 
 NOT_PROVIDED = object()
+
+
+def convert_schema(spec):
+    t = spec.pop('type')
+    name = spec.pop('name')
+    if t in ('int', 'integer'):
+        return Int(name, **spec)
+    elif t in ('str', 'string'):
+        return Str(name, **spec)
+    elif t in ('bool', 'boolean'):
+        return Bool(name, **spec)
+    elif t == 'dict':
+        return Dict(name, **spec)
+    raise ValueError(f'Unknown type: {t}')
 
 
 class Schemas(dict):
@@ -59,8 +77,10 @@ class EnumMixin(object):
 
 class Attribute(object):
 
-    def __init__(self, name, title=None, description=None, required=False, null=False, empty=True, private=False,
-                 validators=None, register=False, hidden=False, editable=True, **kwargs):
+    def __init__(
+        self, name='', title=None, description=None, required=False, null=False, empty=True, private=False,
+        validators=None, register=False, hidden=False, editable=True, example=None, **kwargs
+    ):
         self.name = name
         self.has_default = 'default' in kwargs and kwargs['default'] is not NOT_PROVIDED
         self.default = kwargs.pop('default', None)
@@ -74,6 +94,14 @@ class Attribute(object):
         self.register = register
         self.hidden = hidden
         self.editable = editable
+        self.resolved = False
+        if example:
+            self.description = (description or '') + '\n' + textwrap.dedent(f'''
+            Example(s):
+            ```
+            ''') + json.dumps(example, indent=4) + textwrap.dedent('''
+            ```
+            ''')
         # When a field is marked as non-editable, it must specify a default
         if not self.editable and not self.has_default:
             raise Error(self.name, 'Default value must be specified when attribute is marked as non-editable.')
@@ -150,6 +178,7 @@ class Attribute(object):
             Dict('schema-test', ...)
         )
         """
+        self.resolved = True
         if self.register:
             schemas.add(self)
         return self
@@ -361,6 +390,9 @@ class IPAddr(Str):
 class Time(Str):
 
     def clean(self, value):
+        if isinstance(value, time):
+            return value
+
         value = super(Time, self).clean(value)
         if value is None:
             return value
@@ -374,6 +406,23 @@ class Time(Str):
                 return time(int(hours), int(minutes))
             except TypeError:
                 raise ValueError('Time should be in 24 hour format like "18:00"')
+
+    def validate(self, value):
+        return super().validate(str(value))
+
+
+class Datetime(Str):
+
+    def clean(self, value):
+        if isinstance(value, datetime):
+            return value
+        value = super().clean(value)
+        if value is None:
+            return value
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (TypeError, ValueError):
+            raise ValueError('Invalid datetime specified')
 
     def validate(self, value):
         return super().validate(str(value))
@@ -534,9 +583,11 @@ class List(EnumMixin, Attribute):
 
     def resolve(self, schemas):
         for index, i in enumerate(self.items):
-            self.items[index] = i.resolve(schemas)
+            if not i.resolved:
+                self.items[index] = i.resolve(schemas)
         if self.register:
             schemas.add(self)
+        self.resolved = True
         return self
 
     def copy(self):
@@ -549,7 +600,14 @@ class List(EnumMixin, Attribute):
 
 class Dict(Attribute):
 
-    def __init__(self, name, *attrs, **kwargs):
+    def __init__(self, *attrs, **kwargs):
+        # TODO: Let's please perhaps have name as a keyword argument when we add support for
+        # optional name argument in accepts decorator
+        if list(attrs) and isinstance(attrs[0], str):
+            name = attrs[0]
+            attrs = list(attrs[1:])
+        else:
+            name = ''
         self.additional_attrs = kwargs.pop('additional_attrs', False)
         self.conditional_defaults = kwargs.pop('conditional_defaults', {})
         self.strict = kwargs.pop('strict', False)
@@ -696,9 +754,14 @@ class Dict(Attribute):
 
     def resolve(self, schemas):
         for name, attr in list(self.attrs.items()):
-            self.attrs[name] = attr.resolve(schemas)
+            if not attr.resolved:
+                new_name = attr.newname if isinstance(attr, Patch) else name
+                self.attrs[new_name] = attr.resolve(schemas)
+                if new_name != name:
+                    self.attrs.pop(name)
         if self.register:
             schemas.add(self)
+        self.resolved = True
         return self
 
     def copy(self):
@@ -713,7 +776,7 @@ class Cron(Dict):
 
     FIELDS = ['minute', 'hour', 'dom', 'month', 'dow']
 
-    def __init__(self, name, **kwargs):
+    def __init__(self, name='', **kwargs):
         self.additional_attrs = kwargs.pop('additional_attrs', False)
         exclude = kwargs.pop('exclude', [])
         defaults = kwargs.pop('defaults', {})
@@ -826,6 +889,7 @@ class Ref(object):
 
     def __init__(self, name):
         self.name = name
+        self.resolved = False
 
     def resolve(self, schemas):
         schema = schemas.get(self.name)
@@ -833,6 +897,8 @@ class Ref(object):
             raise ResolverError('Schema {0} does not exist'.format(self.name))
         schema = schema.copy()
         schema.register = False
+        schema.resolved = True
+        self.resolved = True
         return schema
 
 
@@ -841,21 +907,9 @@ class Patch(object):
     def __init__(self, name, newname, *patches, register=False):
         self.name = name
         self.newname = newname
-        self.patches = patches
+        self.patches = list(patches)
         self.register = register
-
-    def convert(self, spec):
-        t = spec.pop('type')
-        name = spec.pop('name')
-        if t in ('int', 'integer'):
-            return Int(name, **spec)
-        elif t in ('str', 'string'):
-            return Str(name, **spec)
-        elif t in ('bool', 'boolean'):
-            return Bool(name, **spec)
-        elif t == 'dict':
-            return Dict(name, **spec)
-        raise ValueError('Unknown type: {0}'.format(spec['type']))
+        self.resolved = False
 
     def resolve(self, schemas):
         schema = schemas.get(self.name)
@@ -867,25 +921,104 @@ class Patch(object):
         schema = schema.copy()
         schema.name = self.newname
         for operation, patch in self.patches:
-            if operation == 'add':
-                if isinstance(patch, dict):
-                    new = self.convert(dict(patch))
-                else:
-                    new = copy.deepcopy(patch)
-                schema.attrs[new.name] = new
-            elif operation == 'rm':
-                del schema.attrs[patch['name']]
-            elif operation == 'edit':
-                attr = schema.attrs[patch['name']]
-                if 'method' in patch:
-                    patch['method'](attr)
-                    schema.attrs[patch['name']] = attr.resolve(schemas)
-            elif operation == 'attr':
-                for key, val in list(patch.items()):
-                    setattr(schema, key, val)
+            if operation == 'replace':
+                # This is for convenience where it's hard sometimes to change attrs in a large dict
+                # with custom function(s) outlining the operation - it's easier to just replace the attr
+                name = patch['name'] if isinstance(patch, dict) else patch.name
+                self._resolve_internal(schema, schemas, 'rm', {'name': name})
+                operation = 'add'
+            self._resolve_internal(schema, schemas, operation, patch)
         if self.register:
             schemas.add(schema)
+        schema.resolved = True
+        self.resolved = True
         return schema
+
+    def _resolve_internal(self, schema, schemas, operation, patch):
+        if operation == 'add':
+            if isinstance(patch, dict):
+                new = convert_schema(dict(patch))
+            else:
+                new = copy.deepcopy(patch)
+            schema.attrs[new.name] = new
+        elif operation == 'rm':
+            if patch.get('safe_delete') and patch['name'] not in schema.attrs:
+                return
+            del schema.attrs[patch['name']]
+        elif operation == 'edit':
+            attr = schema.attrs[patch['name']]
+            if 'method' in patch:
+                patch['method'](attr)
+                schema.attrs[patch['name']] = attr.resolve(schemas)
+        elif operation == 'attr':
+            for key, val in list(patch.items()):
+                setattr(schema, key, val)
+
+
+class OROperator:
+    def __init__(self, *schemas, **kwargs):
+        self.name = kwargs.get('name', '')
+        self.title = kwargs.get('title') or self.name
+        self.schemas = list(schemas)
+        self.description = kwargs.get('description')
+        self.resolved = False
+
+    def clean(self, value):
+        found = False
+        final_value = value
+        verrors = ValidationErrors()
+        for index, i in enumerate(self.schemas):
+            try:
+                tmpval = copy.deepcopy(value)
+                final_value = i.clean(tmpval)
+            except (Error, ValidationErrors) as e:
+                if isinstance(e, Error):
+                    verrors.add(e.attribute, e.errmsg, e.errno)
+                else:
+                    verrors.extend(e)
+            else:
+                found = True
+                break
+        if found is not True:
+            raise Error(self.name, f'Result does not match specified schema: {verrors}')
+        return final_value
+
+    def validate(self, value):
+        verrors = ValidationErrors()
+        attr_verrors = ValidationErrors()
+        for attr in self.schemas:
+            try:
+                attr.validate(value)
+            except TypeError:
+                pass
+            except ValidationErrors as e:
+                attr_verrors.extend(e)
+            else:
+                break
+        else:
+            verrors.extend(attr_verrors)
+
+        verrors.check()
+
+    def to_json_schema(self, parent=None):
+        return {
+            'anyOf': [i.to_json_schema() for i in self.schemas],
+            'nullable': False,
+            '_name_': self.name,
+            'description': self.description,
+        }
+
+    def resolve(self, schemas):
+        for index, i in enumerate(self.schemas):
+            if not i.resolved:
+                self.schemas[index] = i.resolve(schemas)
+        self.resolved = True
+        return self
+
+    def copy(self):
+        cp = copy.deepcopy(self)
+        cp.register = False
+        return cp
 
 
 class ResolverError(Exception):
@@ -895,18 +1028,20 @@ class ResolverError(Exception):
 def resolver(schemas, f):
     if not callable(f):
         return
-    if not hasattr(f, 'accepts'):
-        return
-    new_params = []
-    for p in f.accepts:
-        if isinstance(p, (Patch, Ref, Attribute)):
-            new_params.append(p.resolve(schemas))
-        else:
-            raise ResolverError('Invalid parameter definition {0}'.format(p))
 
-    # FIXME: for some reason assigning params (f.accepts = new_params) does not work
-    f.accepts.clear()
-    f.accepts.extend(new_params)
+    for schema_type in filter(functools.partial(hasattr, f), ('accepts', 'returns')):
+        new_params = []
+        schema_obj = getattr(f, schema_type)
+        for p in schema_obj:
+            if isinstance(p, (Patch, Ref, Attribute, OROperator)):
+                resolved = p if p.resolved else p.resolve(schemas)
+                new_params.append(resolved)
+            else:
+                raise ResolverError(f'Invalid parameter definition {p}')
+
+        # FIXME: for some reason assigning params (f.accepts = new_params) does not work
+        schema_obj.clear()
+        schema_obj.extend(new_params)
 
 
 def resolve_methods(schemas, to_resolve):
@@ -924,6 +1059,60 @@ def resolve_methods(schemas, to_resolve):
             raise ValueError(f'Not all schemas could be resolved: {to_resolve}')
 
 
+def validate_return_type(func, result, schemas):
+    if not schemas and result is None:
+        return
+    elif not schemas:
+        raise ValueError(f'Return schema missing for {func.__name__!r}')
+
+    result = copy.deepcopy(result)
+    if not isinstance(result, tuple):
+        result = [result]
+
+    verrors = ValidationErrors()
+    for res_entry, schema in zip(result, schemas):
+        clean_and_validate_arg(verrors, schema, res_entry)
+    verrors.check()
+
+
+def clean_and_validate_arg(verrors, attr, arg):
+    try:
+        value = attr.clean(arg)
+        attr.validate(value)
+        return value
+    except Error as e:
+        verrors.add(e.attribute, e.errmsg, e.errno)
+    except ValidationErrors as e:
+        verrors.extend(e)
+
+
+def returns(*schema):
+    def returns_internal(f):
+        if asyncio.iscoroutinefunction(f):
+            async def nf(*args, **kwargs):
+                res = await f(*args, **kwargs)
+                if conf.debug_mode:
+                    validate_return_type(f, res, nf.returns)
+                return res
+        else:
+            def nf(*args, **kwargs):
+                res = f(*args, **kwargs)
+                if conf.debug_mode:
+                    validate_return_type(f, res, nf.returns)
+                return res
+
+        from middlewared.utils.type import copy_function_metadata
+        copy_function_metadata(f, nf)
+        nf.wraps = f
+        for s in list(schema):
+            s.name = s.name or f.__name__
+            if hasattr(s, 'title'):
+                s.title = s.title or s.name
+        nf.returns = list(schema)
+        return nf
+    return returns_internal
+
+
 def accepts(*schema):
     further_only_hidden = False
     for i in schema:
@@ -932,7 +1121,8 @@ def accepts(*schema):
         elif further_only_hidden:
             raise ValueError("You can't have non-hidden arguments after hidden")
 
-    def wrap(f):
+    def wrap(func):
+        f = func.wraps if hasattr(func, 'wraps') else func
         if inspect.getfullargspec(f).defaults:
             raise ValueError("All public method default arguments should be specified in @accepts()")
 
@@ -955,20 +1145,10 @@ def accepts(*schema):
 
             verrors = ValidationErrors()
 
-            def clean_and_validate_arg(attr, arg):
-                try:
-                    value = attr.clean(arg)
-                    attr.validate(value)
-                    return value
-                except Error as e:
-                    verrors.add(e.attribute, e.errmsg, e.errno)
-                except ValidationErrors as e:
-                    verrors.extend(e)
-
             # Iterate over positional args first, excluding self
             i = 0
             for _ in args[args_index:]:
-                args[args_index + i] = clean_and_validate_arg(nf.accepts[i], args[args_index + i])
+                args[args_index + i] = clean_and_validate_arg(verrors, nf.accepts[i], args[args_index + i])
                 i += 1
 
             # Use i counter to map keyword argument to rpc positional
@@ -988,25 +1168,27 @@ def accepts(*schema):
                     i += 1
                     continue
 
-                kwargs[kwarg] = clean_and_validate_arg(attr, value)
+                kwargs[kwarg] = clean_and_validate_arg(verrors, attr, value)
 
             if verrors:
                 raise verrors
 
             return args, kwargs
 
-        if asyncio.iscoroutinefunction(f):
+        if asyncio.iscoroutinefunction(func):
             async def nf(*args, **kwargs):
                 args, kwargs = clean_and_validate_args(args, kwargs)
-                return await f(*args, **kwargs)
+                return await func(*args, **kwargs)
         else:
             def nf(*args, **kwargs):
                 args, kwargs = clean_and_validate_args(args, kwargs)
-                return f(*args, **kwargs)
+                return func(*args, **kwargs)
 
         from middlewared.utils.type import copy_function_metadata
         copy_function_metadata(f, nf)
         nf.accepts = list(schema)
+        if hasattr(func, 'returns'):
+            nf.returns = func.returns
         nf.wraps = f
         nf.wrap = wrap
 

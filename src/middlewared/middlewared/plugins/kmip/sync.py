@@ -1,3 +1,4 @@
+from middlewared.schema import Bool, returns
 from middlewared.service import accepts, CallError, job, periodic, private, Service
 
 from .connection import KMIPServerMixin
@@ -36,6 +37,7 @@ class KMIPService(Service, KMIPServerMixin):
             return True
 
     @accepts()
+    @returns(Bool('pending_kmip_sync'))
     async def kmip_sync_pending(self):
         """
         Returns true or false based on if there are keys which are to be synced from local database to remote KMIP
@@ -47,6 +49,7 @@ class KMIPService(Service, KMIPServerMixin):
 
     @periodic(interval=86400)
     @accepts()
+    @returns()
     async def sync_keys(self):
         """
         Sync ZFS/SED keys between KMIP Server and TN database.
@@ -58,6 +61,7 @@ class KMIPService(Service, KMIPServerMixin):
         await self.middleware.call('kmip.sync_sed_keys')
 
     @accepts()
+    @returns()
     async def clear_sync_pending_keys(self):
         """
         Clear all keys which are pending to be synced between KMIP server and TN database.

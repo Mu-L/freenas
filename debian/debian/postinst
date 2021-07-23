@@ -16,7 +16,8 @@ for file in \
     /etc/cron.daily/sysstat \
     /etc/cron.weekly/man-db \
     /etc/grub.d/10_linux \
-    /etc/grub.d/30_os-prober
+    /etc/grub.d/30_os-prober \
+    /etc/logrotate.d/syslog-ng
 do
     dpkg-divert --add --package truenas --rename --divert "/var/trash/$(echo "$file" | sed "s/\//_/g")" "$file"
 done
@@ -33,7 +34,6 @@ systemctl disable scst
 systemctl disable inadyn
 systemctl disable tftpd-hpa
 systemctl disable proftpd
-systemctl disable netatalk
 systemctl disable nmbd
 systemctl disable smbd
 systemctl disable winbind
@@ -50,8 +50,11 @@ update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
 update-alternatives --set arptables /usr/sbin/arptables-legacy
 update-alternatives --set ebtables /usr/sbin/ebtables-legacy
 
+# Add nut to dialout group - NAS-110578
+usermod -a -G dialout nut
+
 # Copy to /conf/base
-for bit in /etc/aliases /etc/group /etc/passwd /etc/syslog-ng/syslog-ng.conf /var/log; do
+for bit in /etc/aliases /etc/group /etc/passwd /etc/syslog-ng/syslog-ng.conf; do
     mkdir -p "$(dirname "/conf/base/$bit")"
     cp -aR "$bit" "/conf/base/$bit"
 done

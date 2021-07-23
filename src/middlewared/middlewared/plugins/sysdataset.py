@@ -1,4 +1,4 @@
-from middlewared.schema import accepts, Bool, Dict, Str
+from middlewared.schema import accepts, Bool, Dict, Int, returns, Str
 from middlewared.service import CallError, ConfigService, ValidationErrors, job, private
 import middlewared.sqlalchemy as sa
 from middlewared.utils import osc, Popen, run
@@ -36,6 +36,19 @@ class SystemDatasetService(ConfigService):
         datastore_extend = 'systemdataset.config_extend'
         datastore_prefix = 'sys_'
         cli_namespace = 'system.system_dataset'
+
+    ENTRY = Dict(
+        'systemdataset_entry',
+        Int('id', required=True),
+        Str('pool', required=True),
+        Str('uuid', required=True),
+        Str('uuid_b', required=True, null=True),
+        Bool('is_decrypted', required=True),
+        Str('basename', required=True),
+        Str('uuid_a', required=True),
+        Bool('syslog', required=True),
+        Str('path', required=True, null=True),
+    )
 
     @private
     async def config_extend(self, config):
@@ -84,6 +97,7 @@ class SystemDatasetService(ConfigService):
         return config
 
     @accepts()
+    @returns(Dict('systemdataset_pool_choices', additional_attrs=True))
     async def pool_choices(self):
         """
         Retrieve pool choices which can be used for configuring system dataset.
@@ -345,12 +359,14 @@ class SystemDatasetService(ConfigService):
             i['id']: i['properties'] for i in await self.middleware.call('zfs.dataset.query', [('id', 'in', datasets)])
         }
         for dataset in datasets:
+            props = {'mountpoint': 'legacy', 'readonly': 'off'}
             is_cores_ds = dataset.endswith('/cores')
-            dataset_quota = {'quota': '1G'} if is_cores_ds else {}
+            if is_cores_ds:
+                props['quota'] = '1G'
             if dataset not in datasets_prop:
                 await self.middleware.call('zfs.dataset.create', {
                     'name': dataset,
-                    'properties': {'mountpoint': 'legacy', **dataset_quota},
+                    'properties': props,
                 })
                 createdds = True
             elif is_cores_ds and datasets_prop[dataset]['used']['parsed'] >= 1024 ** 3:
@@ -358,16 +374,13 @@ class SystemDatasetService(ConfigService):
                     await self.middleware.call('zfs.dataset.delete', dataset, {'force': True, 'recursive': True})
                     await self.middleware.call('zfs.dataset.create', {
                         'name': dataset,
-                        'properties': {'mountpoint': 'legacy', **dataset_quota},
+                        'properties': props,
                     })
                 except Exception:
                     self.logger.warning("Failed to replace dataset [%s].", dataset, exc_info=True)
             else:
-                update_props_dict = {}
-                if datasets_prop[dataset]['mountpoint']['value'] != 'legacy':
-                    update_props_dict['mountpoint'] = {'value': 'legacy'}
-                if dataset_quota and datasets_prop[dataset]['quota']['value'] != '1G':
-                    update_props_dict['quota'] = {'value': '1G'}
+                update_props_dict = {k: {'value': v} for k, v in props.items()
+                                     if datasets_prop[dataset][k]['value'] != v}
                 if update_props_dict:
                     await self.middleware.call(
                         'zfs.dataset.update',
@@ -397,7 +410,7 @@ class SystemDatasetService(ConfigService):
             await init_job.wait()
             if init_job.error:
                 self.logger.error(
-                    'Failed to initilize %s directory with error: %s',
+                    'Failed to initialize %s directory with error: %s',
                     CTDBConfig.CTDB_VOL_NAME.value,
                     init_job.error
                 )
@@ -552,3 +565,15 @@ async def pool_post_import(middleware, pool):
 
 async def setup(middleware):
     middleware.register_hook('pool.post_import', pool_post_import, sync=True)
+
+    try:
+        if not os.path.exists('/var/cache/nscd') or not os.path.islink('/var/cache/nscd'):
+            if os.path.exists('/var/cache/nscd'):
+                shutil.rmtree('/var/cache/nscd')
+
+            os.makedirs('/tmp/cache/nscd', exist_ok=True)
+
+            if not os.path.islink('/var/cache/nscd'):
+                os.symlink('/tmp/cache/nscd', '/var/cache/nscd')
+    except Exception:
+        middleware.logger.error('Error moving cache away from boot pool', exc_info=True)

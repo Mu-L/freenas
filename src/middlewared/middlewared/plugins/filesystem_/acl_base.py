@@ -11,15 +11,10 @@ OS_FLAG = OS_TYPE_FREEBSD if osc.IS_FREEBSD else OS_TYPE_LINUX
 class ACLType(enum.Enum):
     NFS4 = (OS_TYPE_FREEBSD, ['tag', 'id', 'perms', 'flags', 'type'])
     POSIX1E = (OS_TYPE_FREEBSD | OS_TYPE_LINUX, ['default', 'tag', 'id', 'perms'])
-    RICH = (OS_TYPE_LINUX,)
-    SAMBA = (OS_TYPE_LINUX,)
 
     def validate(self, theacl):
         errors = []
         ace_keys = self.value[1]
-        if not self.value[0] & OS_FLAG:
-            errors.append("The host operating system does not support"
-                          f"ACLType [{self.name}]")
 
         if self != ACLType.NFS4 and theacl.get('nfs41flags'):
             errors.append(f"NFS41 ACL flags are not valid for ACLType [{self.name}]")
@@ -28,9 +23,13 @@ class ACLType(enum.Enum):
             extra = set(entry.keys()) - set(ace_keys)
             missing = set(ace_keys) - set(entry.keys())
             if extra:
-                errors.append(f"ACL entry [{idx}] contains invalid extra key(s): {extra}")
+                errors.append(
+                    (idx, f"ACL entry contains invalid extra key(s): {extra}")
+                )
             if missing:
-                errors.append(f"ACL entry [{idx}] is missing required keys(s): {missing}")
+                errors.append(
+                    (idx, f"ACL entry is missing required keys(s): {missing}")
+                )
 
         return {"is_valid": len(errors) == 0, "errors": errors}
 
@@ -248,7 +247,7 @@ class ACLBase(ServicePartBase):
                 Bool('autoinherit', default=False),
                 Bool('protected', default=False),
             ),
-            Str('acltype', enum=[x.name for x in ACLType], default=ACLType.NFS4.name),
+            Str('acltype', enum=[x.name for x in ACLType], null=True),
             Dict(
                 'options',
                 Bool('stripacl', default=False),
@@ -263,6 +262,11 @@ class ACLBase(ServicePartBase):
         """
         Set ACL of a given path. Takes the following parameters:
         `path` full path to directory or file.
+
+        Paths on clustered volumes may be specifed with the path prefix
+        `CLUSTER:<volume name>`. For example, to list directories
+        in the directory 'data' in the clustered volume `smb01`, the
+        path should be specified as `CLUSTER:smb01/data`.
 
         `dacl` ACL entries. Formatting depends on the underlying `acltype`. NFS4ACL requires
         NFSv4 entries. POSIX1e requires POSIX1e entries.
@@ -293,34 +297,40 @@ class ACLBase(ServicePartBase):
     @accepts(
         Str('path'),
         Bool('simplified', default=True),
+        Bool('resolve_ids', default=False),
     )
-    def getacl(self, path, simplified):
+    def getacl(self, path, simplified, resolve_ids):
         """
         Return ACL of a given path. This may return a POSIX1e ACL or a NFSv4 ACL. The acl type is indicated
-        by the `ACLType` key.
+        by the `acltype` key.
+
+        `simplified` - effect of this depends on ACL type on underlying filesystem. In the case of
+        NFSv4 ACLs simplified permissions and flags are returned for ACL entries where applicable.
+        NFSv4 errata below. In the case of POSIX1E ACls, this setting has no impact on returned ACL.
+
+        `resolve_ids` - adds additional `who` key to each ACL entry, that converts the numeric id to
+        a user name or group name. In the case of owner@ and group@ (NFSv4) or USER_OBJ and GROUP_OBJ
+        (POSIX1E), st_uid or st_gid will be converted from stat() return for file. In the case of
+        MASK (POSIX1E), OTHER (POSIX1E), everyone@ (NFSv4), key `who` will be included, but set to null.
+        In case of failure to resolve the id to a name, `who` will be set to null. This option should
+        only be used if resolving ids to names is required.
 
         Errata about ACLType NFSv4:
 
-        `simplified` returns a shortened form of the ACL permset and flags.
+        `simplified` returns a shortened form of the ACL permset and flags where applicable. If permissions
+        have been simplified, then the `perms` object will contain only a single `BASIC` key with a string
+        describing the underlying permissions set.
 
         `TRAVERSE` sufficient rights to traverse a directory, but not read contents.
 
         `READ` sufficient rights to traverse a directory, and read file contents.
 
-        `MODIFIY` sufficient rights to traverse, read, write, and modify a file. Equivalent to modify_set.
+        `MODIFIY` sufficient rights to traverse, read, write, and modify a file.
 
         `FULL_CONTROL` all permissions.
 
         If the permisssions do not fit within one of the pre-defined simplified permissions types, then
         the full ACL entry will be returned.
-
-        In all cases we replace USER_OBJ, GROUP_OBJ, and EVERYONE with owner@, group@, everyone@ for
-        consistency with getfacl and setfacl. If one of aforementioned special tags is used, 'id' must
-        be set to None.
-
-        An inheriting empty everyone@ ACE is appended to non-trivial ACLs in order to enforce Windows
-        expectations regarding permissions inheritance. This entry is removed from NT ACL returned
-        to SMB clients when 'ixnas' samba VFS module is enabled. We also remove it here to avoid confusion.
         """
 
     @accepts(
@@ -370,7 +380,12 @@ class ACLBase(ServicePartBase):
     @job(lock="perm_change")
     def setperm(self, job, data):
         """
-        Remove extended ACL from specified path.
+        Set unix permissions on given `path`.
+
+        Paths on clustered volumes may be specifed with the path prefix
+        `CLUSTER:<volume name>`. For example, to list directories
+        in the directory 'data' in the clustered volume `smb01`, the
+        path should be specified as `CLUSTER:smb01/data`.
 
         If `mode` is specified then the mode will be applied to the
         path and files and subdirectories depending on which `options` are
@@ -403,7 +418,7 @@ class ACLBase(ServicePartBase):
 
     @accepts(
         Str('acl_type', default='OPEN', enum=ACLDefault.options()),
-        Str('share_type', default='NONE', enum=['NONE', 'AFP', 'SMB', 'NFS']),
+        Str('share_type', default='NONE', enum=['NONE', 'SMB', 'NFS']),
     )
     async def get_default_acl(self, acl_type, share_type):
         """

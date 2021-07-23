@@ -111,7 +111,7 @@ digit = ''.join(random.choices(string.digits, k=2))
 hostname = f'test{digit}'
 domain = f'test{digit}.nb.ixsystems.com'
 
-cfg_content = f"""#!/usr/bin/env python3.6
+cfg_content = f"""#!/usr/bin/env python{version}
 
 user = "root"
 password = "{passwd}"
@@ -153,27 +153,24 @@ cfg_file.writelines(f'sshKey = "{Key}"\n')
 cfg_file.close()
 
 
-call(
-    [
-        f"pytest-{version}",
-        "-v",
-        "--junitxml",
-        'results/api_v2_tests_result.xml',
-        f"api2/{testName}"
-    ]
-)
+call([
+    f"pytest-{version}",
+    "-v",
+    "-o", "junit_family=xunit2",
+    "--junitxml",
+    'results/api_v2_tests_result.xml',
+    f"api2/{testName}"
+])
 
 # get useful logs
 artifacts = f"{workdir}/artifacts/"
 logs_list = [
+    "/var/log/daemon.log",
+    "/var/log/debug",
     "/var/log/middlewared.log",
-    "/var/log/messages"
+    "/var/log/messages",
+    "/var/log/syslog",
 ]
-if scale:
-    logs_list.append("/var/log/debug")
-else:
-    logs_list.append("/var/log/debug.log")
-    logs_list.append("/var/log/console.log")
 
 if not os.path.exists(artifacts):
     os.makedirs(artifacts)
@@ -190,6 +187,6 @@ dmsg.close()
 
 # get core.get_jobs and put it in artifacts
 results = SSH_TEST('midclt call core.get_jobs | jq .', 'root', 'testing', ip)
-dmsg = open(f'{artifacts}/core_get_job', 'w')
+dmsg = open(f'{artifacts}/core.get_jobs', 'w')
 dmsg.writelines(results['output'])
 dmsg.close()

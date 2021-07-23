@@ -1,4 +1,4 @@
-from middlewared.schema import Bool, Dict, Int, List, Ref, Str, accepts
+from middlewared.schema import accepts, Bool, Dict, Int, List, Patch, Ref, returns, Str
 from middlewared.service import CallError, ConfigService, ValidationErrors, job, periodic, private
 import middlewared.sqlalchemy as sa
 from middlewared.utils import osc
@@ -21,7 +21,6 @@ import json
 import os
 import pickle
 import smtplib
-import socket
 import syslog
 
 
@@ -110,31 +109,52 @@ class MailService(ConfigService):
         datastore_extend = 'mail.mail_extend'
         cli_namespace = 'system.mail'
 
+    ENTRY = Dict(
+        'mail_entry',
+        Str('fromemail', validators=[Email()], required=True),
+        Str('fromname', required=True),
+        Str('outgoingserver', required=True),
+        Int('port', required=True),
+        Str('security', enum=['PLAIN', 'SSL', 'TLS'], required=True),
+        Bool('smtp', required=True),
+        Str('user', null=True, required=True),
+        Str('pass', private=True, null=True, required=True),
+        Dict(
+            'oauth',
+            Str('client_id'),
+            Str('client_secret'),
+            Str('refresh_token'),
+            null=True,
+            private=True,
+            required=True,
+        ),
+        Int('id', required=True),
+    )
+
     @private
     async def mail_extend(self, cfg):
         if cfg['security']:
             cfg['security'] = cfg['security'].upper()
         return cfg
 
-    @accepts(Dict(
-        'mail_update',
-        Str('fromemail', validators=[Email()]),
-        Str('fromname'),
-        Str('outgoingserver'),
-        Int('port'),
-        Str('security', enum=['PLAIN', 'SSL', 'TLS']),
-        Bool('smtp'),
-        Str('user'),
-        Str('pass', private=True),
-        Dict('oauth',
-             Str('client_id', required=True),
-             Str('client_secret', required=True),
-             Str('refresh_token', required=True),
-             null=True,
-             private=True),
-        register=True,
-        update=True,
-    ))
+    @accepts(
+        Patch(
+            'mail_entry', 'mail_update',
+            ('rm', {'name': 'id'}),
+            (
+                'replace', Dict(
+                    'oauth',
+                    Str('client_id', required=True),
+                    Str('client_secret', required=True),
+                    Str('refresh_token', required=True),
+                    null=True,
+                    private=True,
+                )
+            ),
+            ('attr', {'update': True}),
+            register=True
+        )
+    )
     async def do_update(self, data):
         """
         Update Mail Service Configuration.
@@ -205,6 +225,7 @@ class MailService(ConfigService):
         Dict('extra_headers', additional_attrs=True),
         register=True,
     ), Ref('mail_update'))
+    @returns(Bool('successfully_sent'))
     @job(pipes=['input'], check_pipes=False)
     def send(self, job, message, config):
         """
@@ -301,7 +322,7 @@ class MailService(ConfigService):
         else:
             interval = timedelta(seconds=interval)
 
-        sw_name = self.middleware.call_sync('system.info')['version'].split('-', 1)[0]
+        sw_name = self.middleware.call_sync('system.version').split('-', 1)[0]
 
         channel = message.get('channel')
         if not channel:
@@ -384,9 +405,14 @@ class MailService(ConfigService):
             msg['Cc'] = ', '.join(message.get('cc'))
         msg['Date'] = formatdate()
 
-        local_hostname = socket.gethostname()
+        local_hostname = self.middleware.call_sync('system.hostname')
 
-        msg['Message-ID'] = "<%s-%s.%s@%s>" % (sw_name.lower(), datetime.utcnow().strftime("%Y%m%d.%H%M%S.%f"), base64.urlsafe_b64encode(os.urandom(3)), local_hostname)
+        msg['Message-ID'] = "<%s-%s.%s@%s>" % (
+            sw_name.lower(),
+            datetime.utcnow().strftime("%Y%m%d.%H%M%S.%f"),
+            base64.urlsafe_b64encode(os.urandom(3)),
+            local_hostname
+        )
 
         extra_headers = message.get('extra_headers') or {}
         for key, val in list(extra_headers.items()):
@@ -441,7 +467,7 @@ class MailService(ConfigService):
         self.middleware.call_sync('network.general.will_perform_activity', 'mail')
 
         if local_hostname is None:
-            local_hostname = socket.gethostname()
+            local_hostname = self.middleware.call_sync('system.hostname')
 
         if not config['outgoingserver'] or not config['port']:
             # See NOTE below.

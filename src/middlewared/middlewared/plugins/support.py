@@ -2,12 +2,11 @@ import errno
 import json
 import requests
 import simplejson
-import socket
 import time
 
 from middlewared.pipe import Pipes
 from middlewared.plugins.system import DEBUG_MAX_SIZE
-from middlewared.schema import Bool, Dict, Int, List, Str, accepts
+from middlewared.schema import accepts, Bool, Dict, Int, List, Patch, returns, Str
 from middlewared.service import CallError, ConfigService, job, ValidationErrors
 import middlewared.sqlalchemy as sa
 from middlewared.utils.network import INTERNET_TIMEOUT
@@ -37,19 +36,20 @@ class SupportService(ConfigService):
         datastore = 'system.support'
         cli_namespace = 'system.support'
 
-    @accepts(Dict(
-        'support_update',
-        Bool('enabled', null=True),
-        Str('name'),
-        Str('title'),
-        Str('email'),
-        Str('phone'),
-        Str('secondary_name'),
-        Str('secondary_title'),
-        Str('secondary_email'),
-        Str('secondary_phone'),
-        update=True
-    ))
+    ENTRY = Dict(
+        'support_entry',
+        Bool('enabled', null=True, required=True),
+        Str('name', required=True),
+        Str('title', required=True),
+        Str('email', required=True),
+        Str('phone', required=True),
+        Str('secondary_name', required=True),
+        Str('secondary_title', required=True),
+        Str('secondary_email', required=True),
+        Str('secondary_phone', required=True),
+        Int('id', required=True),
+    )
+
     async def do_update(self, data):
         """
         Update Proactive Support settings.
@@ -78,6 +78,7 @@ class SupportService(ConfigService):
         return await self.config()
 
     @accepts()
+    @returns(Bool('proactive_support_is_available'))
     async def is_available(self):
         """
         Returns whether Proactive Support is available for this product type and current license.
@@ -86,13 +87,14 @@ class SupportService(ConfigService):
         if not await self.middleware.call('system.is_enterprise'):
             return False
 
-        license = (await self.middleware.call('system.info'))['license']
+        license = await self.middleware.call('system.license')
         if license is None:
             return False
 
         return license['contract_type'] in ['SILVER', 'GOLD']
 
     @accepts()
+    @returns(Bool('proactive_support_is_available_and_enabled'))
     async def is_available_and_enabled(self):
         """
         Returns whether Proactive Support is available and enabled.
@@ -101,22 +103,23 @@ class SupportService(ConfigService):
         return await self.is_available() and (await self.config())['enabled']
 
     @accepts()
+    @returns(List('support_fields', items=[List('support_field', items=[Str('field')])]))
     async def fields(self):
         """
         Returns list of pairs of field names and field titles for Proactive Support.
         """
+        return [
+            ['name', 'Contact Name'],
+            ['title', 'Contact Title'],
+            ['email', 'Contact E-mail'],
+            ['phone', 'Contact Phone'],
+            ['secondary_name', 'Secondary Contact Name'],
+            ['secondary_title', 'Secondary Contact Title'],
+            ['secondary_email', 'Secondary Contact E-mail'],
+            ['secondary_phone', 'Secondary Contact Phone'],
+        ]
 
-        return (
-            ("name", "Contact Name"),
-            ("title", "Contact Title"),
-            ("email", "Contact E-mail"),
-            ("phone", "Contact Phone"),
-            ("secondary_name", "Secondary Contact Name"),
-            ("secondary_title", "Secondary Contact Title"),
-            ("secondary_email", "Secondary Contact E-mail"),
-            ("secondary_phone", "Secondary Contact Phone"),
-        )
-
+    # TODO: Document this please
     @accepts(
         Str('username'),
         Str('password'),
@@ -170,6 +173,12 @@ class SupportService(ConfigService):
         Str('email', validators=[Email()]),
         List('cc', items=[Str('email', validators=[Email()])])
     ))
+    @returns(Dict(
+        'new_ticket_response',
+        Int('ticket', null=True),
+        Str('url', null=True),
+        register=True
+    ))
     @job()
     async def new_ticket(self, job, data):
         """
@@ -192,7 +201,7 @@ class SupportService(ConfigService):
         else:
             required_attrs = ('phone', 'name', 'email', 'criticality', 'environment')
             data['serial'] = (await self.middleware.call('system.dmidecode_info'))['system-serial-number']
-            license = (await self.middleware.call('system.info'))['license']
+            license = await self.middleware.call('system.license')
             if license:
                 data['company'] = license['customer_name']
             else:
@@ -253,7 +262,7 @@ class SupportService(ConfigService):
                 debug_name = 'debug-{}.tar'.format(time.strftime('%Y%m%d%H%M%S'))
             else:
                 debug_name = 'debug-{}-{}.txz'.format(
-                    socket.gethostname().split('.')[0],
+                    (await self.middleware.call('system.hostname')).split('.')[0],
                     time.strftime('%Y%m%d%H%M%S'),
                 )
 
@@ -283,6 +292,7 @@ class SupportService(ConfigService):
                             raise CallError('Debug too large to attach', errno.EFBIG)
                         tjob.pipes.input.w.write(r)
                 finally:
+                    debug_job.pipes.output.r.read()
                     tjob.pipes.input.w.close()
 
             await self.middleware.run_in_thread(copy)
@@ -304,6 +314,7 @@ class SupportService(ConfigService):
         Str('username', private=True),
         Str('password', private=True),
     ))
+    @returns()
     @job(pipes=["input"])
     async def attach_ticket(self, job, data):
         """

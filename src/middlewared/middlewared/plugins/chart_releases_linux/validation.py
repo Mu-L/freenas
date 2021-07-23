@@ -1,6 +1,6 @@
 import itertools
 
-from middlewared.schema import Dict
+from middlewared.schema import Dict, NOT_PROVIDED
 from middlewared.service import CallError, private, Service
 from middlewared.utils import filter_list
 from middlewared.validators import validate_attributes
@@ -23,10 +23,12 @@ class ChartReleaseService(Service):
         namespace = 'chart.release'
 
     @private
-    async def construct_schema_for_item_version(self, item_version_details, new_values, update):
+    async def construct_schema_for_item_version(
+        self, item_version_details, new_values, update, old_values=NOT_PROVIDED
+    ):
         schema_name = f'chart_release_{"update" if update else "create"}'
         attrs = list(itertools.chain.from_iterable(
-            get_schema(q, update) for q in item_version_details['schema']['questions']
+            get_schema(q, update, old_values) for q in item_version_details['schema']['questions']
         ))
         dict_obj = update_conditional_defaults(
             Dict(schema_name, *attrs, update=update, additional_attrs=True), {
@@ -52,7 +54,9 @@ class ChartReleaseService(Service):
             new_values.pop(k[0], None)
 
         verrors, new_values, dict_obj, schema_name = (
-            await self.construct_schema_for_item_version(item_version_details, new_values, update)
+            await self.construct_schema_for_item_version(
+                item_version_details, new_values, update, (release_data or {}).get('config', NOT_PROVIDED)
+            )
         ).values()
 
         verrors.check()

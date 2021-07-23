@@ -1,7 +1,7 @@
 import asyncio
 import collections
 
-from middlewared.schema import Str
+from middlewared.schema import Dict, List, Str, returns
 from middlewared.service import accepts, private, Service
 
 from .utils import get_chart_release_from_namespace, get_namespace, is_ix_namespace
@@ -18,6 +18,27 @@ class ChartReleaseService(Service):
         namespace = 'chart.release'
 
     @accepts(Str('release_name'))
+    @returns(List(
+        'events', items=[Dict(
+            'event',
+            Dict(
+                'involved_object',
+                Str('kind'),
+                Str('name'),
+                Str('namespace'),
+                additional_attrs=True,
+                null=True,
+            ),
+            Dict(
+                'metadata',
+                Str('namespace', required=True),
+                Str('uid', required=True),
+                Str('name', required=True),
+                additional_attrs=True,
+            ),
+            additional_attrs=True,
+        )]
+    ))
     async def events(self, release_name):
         """
         Returns kubernetes events for `release_name` Chart Release.
@@ -65,8 +86,4 @@ async def chart_release_event(middleware, event_type, args):
 async def setup(middleware):
     middleware.event_subscribe('kubernetes.events', chart_release_event)
     if await middleware.call('service.started', 'kubernetes'):
-        try:
-            await middleware.call('chart.release.refresh_events_state')
-        except Exception:
-            # Let's not make this fatal for middleware boot
-            middleware.logger.error('Failed to refresh chart release events state', exc_info=True)
+        asyncio.ensure_future(middleware.call('chart.release.refresh_events_state'))

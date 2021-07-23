@@ -6,7 +6,7 @@ import psutil
 from middlewared.plugins.service_.services.all import all_services
 from middlewared.plugins.service_.services.base import IdentifiableServiceInterface
 
-from middlewared.schema import accepts, Bool, Dict, Int, Ref, Str
+from middlewared.schema import accepts, Bool, Dict, Int, List, Ref, returns, Str
 from middlewared.service import filterable, CallError, CRUDService, private
 from middlewared.service_exception import MatchNotFound
 import middlewared.sqlalchemy as sa
@@ -25,6 +25,15 @@ class ServiceService(CRUDService):
 
     class Config:
         cli_namespace = "service"
+
+    ENTRY = Dict(
+        'service_entry',
+        Int('id'),
+        Str('service'),
+        Bool('enable'),
+        Str('state'),
+        List('pids', items=[Int('pid')]),
+    )
 
     @filterable
     async def query(self, filters, options):
@@ -83,6 +92,7 @@ class ServiceService(CRUDService):
             Bool('enable', default=False),
         ),
     )
+    @returns(Int('service_primary_key'))
     async def do_update(self, id_or_name, data):
         """
         Update service entry of `id_or_name`.
@@ -97,7 +107,9 @@ class ServiceService(CRUDService):
                 raise CallError(f'Service {id_or_name} not found.', errno.ENOENT)
             id_or_name = svc[0]['id']
 
-        rv = await self.middleware.call('datastore.update', 'services.services', id_or_name, {'srv_enable': data['enable']})
+        rv = await self.middleware.call(
+            'datastore.update', 'services.services', id_or_name, {'srv_enable': data['enable']}
+        )
         await self.middleware.call('etc.generate', 'rc')
         return rv
 
@@ -109,6 +121,7 @@ class ServiceService(CRUDService):
             register=True,
         ),
     )
+    @returns(Bool('started_service'))
     async def start(self, service, options):
         """
         Start the service specified by `service`.
@@ -131,6 +144,8 @@ class ServiceService(CRUDService):
             await self.middleware.call('service.notify_running', service)
             return False
 
+    @accepts(Str('service'))
+    @returns(Bool('service_started', description='Will return `true` if service is running'))
     async def started(self, service):
         """
         Test if service specified by `service` has been started.
@@ -144,6 +159,7 @@ class ServiceService(CRUDService):
         Str('service'),
         Ref('service-control'),
     )
+    @returns(Bool('service_stopped', description='Will return `true` if service successfully stopped'))
     async def stop(self, service, options):
         """
         Stop the service specified by `service`.
@@ -171,6 +187,7 @@ class ServiceService(CRUDService):
         Str('service'),
         Ref('service-control'),
     )
+    @returns(Bool('service_restarted'))
     async def restart(self, service, options):
         """
         Restart the service specified by `service`.
@@ -225,6 +242,7 @@ class ServiceService(CRUDService):
         Str('service'),
         Ref('service-control'),
     )
+    @returns(Bool('service_reloaded'))
     async def reload(self, service, options):
         """
         Reload the service specified by `service`.
@@ -284,26 +302,31 @@ class ServiceService(CRUDService):
                     return service_name
 
     @accepts(Int("pid"), Int("timeout", default=10))
+    @returns(Bool(
+        "process_terminated_nicely",
+        description="`true` is process has been successfully terminated with `TERM` and `false` if we had to use `KILL`"
+    ))
     def terminate_process(self, pid, timeout):
         """
         Terminate process by `pid`.
 
         First send `TERM` signal, then, if was not terminated in `timeout` seconds, send `KILL` signal.
-
-        Returns `true` is process has been successfully terminated with `TERM` and `false` if we had to use `KILL`.
         """
         try:
             process = psutil.Process(pid)
+            process.terminate()
+            gone, alive = psutil.wait_procs([process], timeout)
         except psutil.NoSuchProcess:
             raise CallError("Process does not exist")
 
-        process.terminate()
-
-        gone, alive = psutil.wait_procs([process], timeout)
         if not alive:
             return True
 
-        alive[0].kill()
+        try:
+            alive[0].kill()
+        except psutil.NoSuchProcess:
+            return True
+
         return False
 
 

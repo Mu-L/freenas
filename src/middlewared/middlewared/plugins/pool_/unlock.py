@@ -1,6 +1,5 @@
-from middlewared.schema import Str
+from middlewared.schema import Dict, returns, Str
 from middlewared.service import accepts, private, Service
-from middlewared.utils import osc
 
 
 class PoolDatasetService(Service):
@@ -10,13 +9,13 @@ class PoolDatasetService(Service):
         event_send = False
 
     @accepts(Str('dataset'))
+    @returns(Dict('services_to_restart', additional_attrs=True))
     async def unlock_services_restart_choices(self, dataset):
         """
         Get a mapping of services identifiers and labels that can be restart on dataset unlock.
         """
         await self.middleware.call('pool.dataset.get_instance', dataset)
         services = {
-            'afp': 'AFP',
             'cifs': 'SMB',
             'ftp': 'FTP',
             'iscsitarget': 'iSCSI',
@@ -41,16 +40,6 @@ class PoolDatasetService(Service):
                 lambda a: a['service'], await self.middleware.call('pool.dataset.attachments', dataset)
             ) if k in check_services
         })
-
-        if osc.IS_FREEBSD:
-            try:
-                activated_pool = await self.middleware.call('jail.get_activated_pool')
-            except Exception:
-                activated_pool = None
-
-            # If iocage is not activated yet, there is a chance that this pool might have it activated there
-            if activated_pool is None:
-                result['jails'] = 'Jails/Plugins'
 
         if await self.unlock_restarted_vms(dataset):
             result['vms'] = 'Virtual Machines'
@@ -91,7 +80,7 @@ class PoolDatasetService(Service):
     @private
     async def restart_services_after_unlock(self, dataset_name, services_to_restart):
         try:
-            to_restart = [[i] for i in set(services_to_restart) - {'jails', 'vms'}]
+            to_restart = [[i] for i in set(services_to_restart) - {'vms'}]
             if not to_restart:
                 return
 
@@ -103,8 +92,6 @@ class PoolDatasetService(Service):
                         'Failed to restart %r service after %r unlock: %s',
                         to_restart[idx], dataset_name, srv_status['error']
                     )
-            if 'jails' in services_to_restart:
-                await self.middleware.call('jail.rc_action', ['RESTART'])
             if 'vms' in services_to_restart:
                 await self.middleware.call('pool.dataset.restart_vms_after_unlock', dataset_name)
         except Exception:

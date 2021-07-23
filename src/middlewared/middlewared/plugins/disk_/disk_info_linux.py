@@ -53,12 +53,7 @@ class DiskService(Service, DiskInfoBase):
             ),
             block_device.children
         ):
-            if disk.startswith('nvme'):
-                # This is a hack for nvme disks, however let's please come up with a better way
-                # to link disks with their partitions
-                part_name = f'{disk}p{p["ID_PART_ENTRY_NUMBER"]}'
-            else:
-                part_name = f'{disk}{p["ID_PART_ENTRY_NUMBER"]}'
+            part_name = self.get_partition_for_disk(disk, p['ID_PART_ENTRY_NUMBER'])
             part = {
                 'name': part_name,
                 'partition_type': p['ID_PART_ENTRY_TYPE'],
@@ -119,11 +114,19 @@ class DiskService(Service, DiskInfoBase):
 
     def label_to_dev(self, label, *args):
         dev = os.path.realpath(os.path.join('/dev', label)).split('/')[-1]
-        return dev if dev != label.split('/')[-1] else None
+        if dev == label and os.path.exists(os.path.join('/sys/block', label)):
+            # This is to cater for a case where `label` is a complete disk
+            # instead of something like disk/by-partuuid/some-uuid-here
+            return dev
+        else:
+            return dev if dev != label.split('/')[-1] else None
 
     def label_to_disk(self, label, *args):
         part_disk = self.label_to_dev(label)
-        return self.get_disk_from_partition(part_disk) if part_disk else None
+        if part_disk == label:
+            return label
+        else:
+            return self.get_disk_from_partition(part_disk) if part_disk else None
 
     def get_disk_from_partition(self, part_name):
         if not os.path.exists(os.path.join('/dev', part_name)):
@@ -134,3 +137,11 @@ class DiskService(Service, DiskInfoBase):
             # nvme partitions would be like nvmen1p1 where disk is nvmen1
             part_num = f'p{part_num}'
         return part_name.rsplit(part_num, 1)[0].strip()
+
+    def get_partition_for_disk(self, disk, partition):
+        if disk.startswith('nvme'):
+            # This is a hack for nvme disks, however let's please come up with a better way
+            # to link disks with their partitions
+            return f'{disk}p{partition}'
+        else:
+            return f'{disk}{partition}'

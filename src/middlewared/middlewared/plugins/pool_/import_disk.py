@@ -6,7 +6,7 @@ import re
 import subprocess
 
 from middlewared.job import JobProgressBuffer
-from middlewared.schema import Dict, Str
+from middlewared.schema import Dict, returns, Str
 from middlewared.service import accepts, CallError, job, Service
 from middlewared.utils import Popen
 
@@ -21,6 +21,7 @@ class PoolService(Service):
         Dict('fs_options', additional_attrs=True),
         Str('dst_path')
     )
+    @returns()
     @job(lock=lambda args: 'volume_import', logs=True, abortable=True)
     async def import_disk(self, job, device, fs_type, fs_options, dst_path):
         """
@@ -113,6 +114,7 @@ class PoolService(Service):
             os.rmdir(src)
 
     @accepts(Str("device"))
+    @returns(Str('filesystem', null=True))
     def import_disk_autodetect_fs_type(self, device):
         """
         Autodetect filesystem type for `pool.import_disk`.

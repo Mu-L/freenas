@@ -17,12 +17,13 @@ try:
 except ImportError:
     pyinotify = None
 
-from middlewared.main import EventSource
-from middlewared.schema import Bool, Dict, Int, Ref, Str, accepts
-from middlewared.service import private, CallError, Service, job
+from middlewared.event import EventSource
+from middlewared.schema import accepts, Bool, Dict, Float, Int, List, Ref, returns, Path, Str
+from middlewared.service import private, CallError, filterable_returns, Service, job
 from middlewared.utils import filter_list, osc
 from middlewared.utils.path import is_child
 from middlewared.plugins.pwenc import PWENC_FILE_SECRET
+from middlewared.plugins.cluster_linux.utils import CTDBConfig, FuseConfig
 
 
 class FilesystemService(Service):
@@ -30,10 +31,47 @@ class FilesystemService(Service):
     class Config:
         cli_namespace = 'storage.filesystem'
 
+    @private
+    def resolve_cluster_path(self, path):
+        """
+        Convert a "CLUSTER:"-prefixed path to an absolute path
+        on the server.
+        """
+        if not path.startswith(FuseConfig.FUSE_PATH_SUBST.value):
+            return path
+
+        gluster_volume = path[8:].split("/")[0]
+        if gluster_volume == CTDBConfig.CTDB_VOL_NAME.value:
+            raise CallError('access to ctdb volume is not permitted.', errno.EPERM)
+
+        is_mounted = self.middleware.call_sync('gluster.fuse.is_mounted', {'name': gluster_volume})
+        if not is_mounted:
+            raise CallError(f'{gluster_volume}: cluster volume is not mounted.', errno.ENXIO)
+
+        cluster_path = path.replace(FuseConfig.FUSE_PATH_SUBST.value, f'{FuseConfig.FUSE_PATH_BASE.value}/')
+        return cluster_path
+
     @accepts(Str('path', required=True), Ref('query-filters'), Ref('query-options'))
+    @filterable_returns(Dict(
+        'path_entry',
+        Str('name', required=True),
+        Path('path', required=True),
+        Path('realpath', required=True),
+        Str('type', required=True, enum=['DIRECTORY', 'FILESYSTEM', 'SYMLINK', 'OTHER']),
+        Int('size', required=True, null=True),
+        Int('mode', required=True, null=True),
+        Bool('acl', required=True, null=True),
+        Int('uid', required=True, null=True),
+        Int('gid', required=True, null=True),
+    ))
     def listdir(self, path, filters, options):
         """
         Get the contents of a directory.
+
+        Paths on clustered volumes may be specifed with the path prefix
+        `CLUSTER:<volume name>`. For example, to list directories
+        in the directory 'data' in the clustered volume `smb01`, the
+        path should be specified as `CLUSTER:smb01/data`.
 
         Each entry of the list consists of:
           name(str): name of the file
@@ -46,6 +84,7 @@ class FilesystemService(Service):
           gid(int): group id of entry onwer
           acl(bool): extended ACL is present on file
         """
+        path = self.resolve_cluster_path(path)
         if not os.path.exists(path):
             raise CallError(f'Directory {path} does not exist', errno.ENOENT)
 
@@ -65,7 +104,7 @@ class FilesystemService(Service):
 
             data = {
                 'name': entry.name,
-                'path': entry.path,
+                'path': entry.path.replace(f'{FuseConfig.FUSE_PATH_BASE.value}/', FuseConfig.FUSE_PATH_SUBST.value),
                 'realpath': os.path.realpath(entry.path) if etype == 'SYMLINK' else entry.path,
                 'type': etype,
             }
@@ -74,7 +113,7 @@ class FilesystemService(Service):
                 data.update({
                     'size': stat.st_size,
                     'mode': stat.st_mode,
-                    'acl': False if self.acl_is_trivial(data["realpath"]) else True,
+                    'acl': False if self.acl_is_trivial(data["path"]) else True,
                     'uid': stat.st_uid,
                     'gid': stat.st_gid,
                 })
@@ -84,10 +123,32 @@ class FilesystemService(Service):
         return filter_list(rv, filters=filters or [], options=options or {})
 
     @accepts(Str('path'))
+    @returns(Dict(
+        'path_stats',
+        Int('size', required=True),
+        Int('mode', required=True),
+        Int('uid', required=True),
+        Int('gid', required=True),
+        Float('atime', required=True),
+        Float('mtime', required=True),
+        Float('ctime', required=True),
+        Int('dev', required=True),
+        Int('inode', required=True),
+        Int('nlink', required=True),
+        Str('user', null=True, required=True),
+        Str('group', null=True, required=True),
+        Bool('acl', required=True),
+    ))
     def stat(self, path):
         """
         Return the filesystem stat(2) for a given `path`.
+
+        Paths on clustered volumes may be specifed with the path prefix
+        `CLUSTER:<volume name>`. For example, to list directories
+        in the directory 'data' in the clustered volume `smb01`, the
+        path should be specified as `CLUSTER:smb01/data`.
         """
+        path = self.resolve_cluster_path(path)
         try:
             stat = os.stat(path, follow_symlinks=False)
         except FileNotFoundError:
@@ -176,6 +237,7 @@ class FilesystemService(Service):
         return data
 
     @accepts(Str('path'))
+    @returns()
     @job(pipes=["output"])
     async def get(self, job, path):
         """
@@ -196,6 +258,7 @@ class FilesystemService(Service):
             Int('mode'),
         ),
     )
+    @returns(Bool('successful_put'))
     @job(pipes=["input"])
     async def put(self, job, path, options):
         """
@@ -218,6 +281,24 @@ class FilesystemService(Service):
         return True
 
     @accepts(Str('path'))
+    @returns(Dict(
+        'path_statfs',
+        List('flags', required=True),
+        List('fsid', required=True),
+        Str('fstype', required=True),
+        Str('source', required=True),
+        Str('dest', required=True),
+        Int('blocksize', required=True),
+        Int('total_blocks', required=True),
+        Int('free_blocks', required=True),
+        Int('avail_blocks', required=True),
+        Int('files', required=True),
+        Int('free_files', required=True),
+        Int('name_max', required=True),
+        Int('total_bytes', required=True),
+        Int('free_bytes', required=True),
+        Int('avail_bytes', required=True),
+    ))
     def statfs(self, path):
         """
         Return stats from the filesystem of a given path.
@@ -255,23 +336,23 @@ class FilesystemService(Service):
         }
 
     @accepts(Str('path'))
+    @returns(Bool('paths_acl_is_trivial'))
     def acl_is_trivial(self, path):
         """
         Returns True if the ACL can be fully expressed as a file mode without losing
-        any access rules, or if the path does not support NFSv4 ACLs (for example
-        a path on a tmpfs filesystem).
+        any access rules.
+
+        Paths on clustered volumes may be specifed with the path prefix
+        `CLUSTER:<volume name>`. For example, to list directories
+        in the directory 'data' in the clustered volume `smb01`, the
+        path should be specified as `CLUSTER:smb01/data`.
         """
+        path = self.resolve_cluster_path(path)
         if not os.path.exists(path):
             raise CallError(f'Path not found [{path}].', errno.ENOENT)
 
-        if osc.IS_LINUX:
-            posix1e_acl = self.middleware.call_sync('filesystem.getacl_posix1e', path, True)
-            return True if len(posix1e_acl['acl']) == 3 else False
-
-        if not os.pathconf(path, 64):
-            return True
-
-        return acl.ACL(file=path).is_trivial
+        acl = self.middleware.call_sync('filesystem.getacl', path, True)
+        return acl['trivial']
 
 
 class FileFollowTailEventSource(EventSource):

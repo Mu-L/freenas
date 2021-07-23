@@ -102,9 +102,6 @@ class EtcService(Service):
             {'type': 'mako', 'path': 'krb5.conf'},
             {'type': 'py', 'path': 'krb5.keytab'},
         ],
-        'afpd': [
-            {'type': 'py', 'path': 'afpd', 'checkpoint': 'pool_import'},
-        ],
         'cron': [
             {'type': 'mako', 'path': 'cron.d/middlewared', 'checkpoint': 'pool_import'},
             {'type': 'mako', 'path': 'crontab', 'platform': 'FreeBSD'},
@@ -150,7 +147,6 @@ class EtcService(Service):
             {'type': 'mako', 'path': 'default/kdump-tools', 'platform': 'Linux'},
         ],
         'rc': [
-            {'type': 'py', 'path': 'rc.conf', 'platform': 'FreeBSD'},
             {'type': 'py', 'path': 'systemd', 'platform': 'Linux'},
         ],
         'sysctl': [
@@ -221,6 +217,7 @@ class EtcService(Service):
             {'type': 'mako', 'path': 'default/rrdcached', 'platform': 'Linux', 'checkpoint': 'pool_import'},
         ],
         'docker': [
+            {'type': 'mako', 'path': 'systemd/system/docker.service.d/http-proxy.conf', 'checkpoint': None},
             {'type': 'py', 'path': 'docker', 'platform': 'Linux', 'checkpoint': None},
         ],
         'inetd': [
@@ -273,11 +270,12 @@ class EtcService(Service):
             {'type': 'mako', 'path': 'local/sudoers'}
         ],
         'syslogd': [
+            {'type': 'mako', 'path': 'default/syslog-ng', 'checkpoint': 'pool_import'},
             {'type': 'py', 'path': 'syslogd', 'checkpoint': 'pool_import'},
         ],
         'hostname': [
             {'type': 'mako', 'path': 'hosts'},
-            {'type': 'py', 'path': 'hostname', 'platform': 'Linux'},
+            {'type': 'py', 'path': 'hostname', 'platform': 'Linux', 'checkpoint': 'pre_interface_sync'},
         ],
         'ssh': [
             {'type': 'mako', 'path': 'local/ssh/sshd_config', 'checkpoint': 'interface_sync'},
@@ -339,7 +337,7 @@ class EtcService(Service):
     }
     LOCKS = defaultdict(asyncio.Lock)
 
-    checkpoints = ['initial', 'interface_sync', 'post_init', 'pool_import']
+    checkpoints = ['initial', 'interface_sync', 'post_init', 'pool_import', 'pre_interface_sync']
 
     class Config:
         private = True

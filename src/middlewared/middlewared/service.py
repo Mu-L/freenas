@@ -1,3 +1,4 @@
+import copy
 from collections import defaultdict, namedtuple
 from functools import wraps
 
@@ -19,8 +20,9 @@ import psutil
 
 from middlewared.common.environ import environ_update
 import middlewared.main
-from middlewared.schema import accepts, Bool, Dict, Int, List, Ref, Str
+from middlewared.schema import accepts, Any, Bool, convert_schema, Dict, Int, List, OROperator, Patch, Ref, returns, Str
 from middlewared.service_exception import CallException, CallError, ValidationError, ValidationErrors  # noqa
+from middlewared.settings import conf
 from middlewared.utils import filter_list, osc
 from middlewared.utils.debug import get_frame_details, get_threads_stacks
 from middlewared.logger import Logger, reconfigure_logging, stop_logging
@@ -223,6 +225,24 @@ def filterable(fn):
     return accepts(Ref('query-filters'), Ref('query-options'))(fn)
 
 
+def filterable_returns(schema):
+    def filterable_internal(fn):
+        return returns(OROperator(
+            Int('count'),
+            schema,
+            List('query_result', items=[schema]),
+            name='filterable_result',
+        ))(fn)
+    return filterable_internal
+
+
+def get_datastore_primary_key_schema(klass):
+    return convert_schema({
+        'type': klass._config.datastore_primary_key_type,
+        'name': klass._config.datastore_primary_key,
+    })
+
+
 class ServiceBase(type):
     """
     Metaclass of all services
@@ -389,13 +409,63 @@ class CompoundService(Service):
         return f"<CompoundService: {', '.join([repr(part) for part in self.parts])}>"
 
 
-class ConfigService(ServiceChangeMixin, Service):
+class ConfigServiceMetabase(ServiceBase):
+
+    def __new__(cls, name, bases, attrs):
+        klass = super().__new__(cls, name, bases, attrs)
+        if any(
+            name == c_name and len(bases) == len(c_bases) and all(
+                b.__name__ == c_b for b, c_b in zip(bases, c_bases)
+            )
+            for c_name, c_bases in (
+                ('ConfigService', ('ServiceChangeMixin', 'Service')),
+                ('SystemServiceService', ('ConfigService',)),
+            )
+        ):
+            return klass
+
+        namespace = klass._config.namespace.replace('.', '_')
+        config_entry_key = f'{namespace}_entry'
+
+        if klass.ENTRY == NotImplementedError:
+            klass.ENTRY = Dict(config_entry_key, additional_attrs=True)
+
+        config_entry_key = getattr(klass.ENTRY, 'newname' if isinstance(klass.ENTRY, Patch) else 'name')
+
+        config_entry = copy.deepcopy(klass.ENTRY)
+        config_entry.register = True
+        klass.config = returns(config_entry)(klass.config)
+
+        if hasattr(klass, 'do_update'):
+            for m_name, decorator in filter(
+                lambda m: not hasattr(klass.do_update, m[0]),
+                (('returns', returns), ('accepts', accepts))
+            ):
+                new_name = f'{namespace}_update'
+                if m_name == 'returns':
+                    new_name += '_returns'
+                patch_entry = Patch(config_entry_key, new_name, register=True)
+                schema = [patch_entry]
+                if m_name == 'accepts':
+                    patch_entry.patches.append(('rm', {
+                        'name': klass._config.datastore_primary_key,
+                        'safe_delete': True,
+                    }))
+                    patch_entry.patches.append(('attr', {'update': True}))
+                klass.do_update = decorator(*schema)(klass.do_update)
+
+        return klass
+
+
+class ConfigService(ServiceChangeMixin, Service, metaclass=ConfigServiceMetabase):
     """
     Config service abstract class
 
     Meant for services that provide a single set of attributes which can be
     updated or not.
     """
+
+    ENTRY = NotImplementedError
 
     @accepts()
     async def config(self):
@@ -455,7 +525,91 @@ class SystemServiceService(ConfigService):
             asyncio.ensure_future(fut)
 
 
-class CRUDService(ServiceChangeMixin, Service):
+class CRUDServiceMetabase(ServiceBase):
+
+    def __new__(cls, name, bases, attrs):
+        klass = super().__new__(cls, name, bases, attrs)
+        if any(
+            name == c_name and len(bases) == len(c_bases) and all(b.__name__ == c_b for b, c_b in zip(bases, c_bases))
+            for c_name, c_bases in (
+                ('CRUDService', ('ServiceChangeMixin', 'Service')),
+                ('SharingTaskService', ('CRUDService',)),
+                ('SharingService', ('SharingTaskService',)),
+                ('TaskPathService', ('SharingTaskService',)),
+            )
+        ):
+            return klass
+
+        namespace = klass._config.namespace.replace('.', '_')
+        entry_key = f'{namespace}_entry'
+        if klass.ENTRY == NotImplementedError:
+            klass.ENTRY = Dict(entry_key, additional_attrs=True)
+        else:
+            # We would like to ensure that not all fields are required as select can filter out fields
+            if isinstance(klass.ENTRY, Patch):
+                entry_key = klass.ENTRY.newname
+            elif isinstance(klass.ENTRY, Ref):
+                entry_key = f'{klass.ENTRY.name}_ref_entry'
+            elif isinstance(klass.ENTRY, Dict):
+                entry_key = klass.ENTRY.name
+            else:
+                raise ValueError('Result entry should be Dict/Patch/Ref instance')
+
+        result_entry = copy.deepcopy(klass.ENTRY)
+        query_result_entry = copy.deepcopy(klass.ENTRY)
+        if isinstance(result_entry, Ref):
+            query_result_entry = Patch(result_entry.name, entry_key)
+        if isinstance(result_entry, Patch):
+            query_result_entry.patches.append(('attr', {'update': True}))
+        else:
+            query_result_entry.update = True
+
+        result_entry.register = True
+        query_result_entry.register = False
+
+        query_method = klass.query.wraps if hasattr(klass.query, 'returns') else klass.query
+        klass.query = returns(OROperator(
+            List('query_result', items=[copy.deepcopy(query_result_entry)]),
+            query_result_entry,
+            Int('count'),
+            result_entry,
+            name='query_result',
+        ))(query_method)
+
+        for m_name in filter(lambda m: hasattr(klass, m), ('do_create', 'do_update')):
+            for d_name, decorator in filter(
+                lambda d: not hasattr(getattr(klass, m_name), d[0]), (('returns', returns), ('accepts', accepts))
+            ):
+                new_name = f'{namespace}_{m_name.split("_")[-1]}'
+                if d_name == 'returns':
+                    new_name += '_returns'
+
+                patch_entry = Patch(entry_key, new_name, register=True)
+                schema = []
+                if d_name == 'accepts':
+                    patch_entry.patches.append(('rm', {
+                        'name': klass._config.datastore_primary_key,
+                        'safe_delete': True,
+                    }))
+                    if m_name == 'do_update':
+                        patch_entry.patches.append(('attr', {'update': True}))
+                        schema.append(get_datastore_primary_key_schema(klass))
+
+                schema.append(patch_entry)
+                setattr(klass, m_name, decorator(*schema)(getattr(klass, m_name)))
+
+        if hasattr(klass, 'do_delete'):
+            if not hasattr(klass.do_delete, 'accepts'):
+                klass.do_delete = accepts(get_datastore_primary_key_schema(klass))(klass.do_delete)
+            if not hasattr(klass.do_delete, 'returns'):
+                klass.do_delete = returns(Bool(
+                    'deleted', description='Will return `true` if `id` is deleted successfully'
+                ))(klass.do_delete)
+
+        return klass
+
+
+class CRUDService(ServiceChangeMixin, Service, metaclass=CRUDServiceMetabase):
     """
     CRUD service abstract class
 
@@ -464,6 +618,8 @@ class CRUDService(ServiceChangeMixin, Service):
 
     CRUD stands for Create Retrieve Update Delete.
     """
+
+    ENTRY = NotImplementedError
 
     def __init__(self, middleware):
         super().__init__(middleware)
@@ -546,20 +702,32 @@ class CRUDService(ServiceChangeMixin, Service):
         return rv
 
     @private
-    async def get_instance(self, id):
+    @accepts(
+        Any('id'),
+        Patch(
+            'query-options', 'query-options-get_instance',
+            ('edit', {
+                'name': 'force_sql_filters',
+                'method': lambda x: setattr(x, 'default', True),
+            }),
+            register=True,
+        ),
+    )
+    async def get_instance(self, id, options):
         """
         Returns instance matching `id`. If `id` is not found, Validation error is raised.
         """
-        return await self._get_instance(id)
+        return await self._get_instance(id, options)
 
-    async def _get_instance(self, id):
+    @accepts(Any('id'), Ref('query-options-get_instance'))
+    async def _get_instance(self, id, options):
         """
         Helper method to get an instance from a collection given the `id`.
         """
         instance = await self.middleware.call(
             f'{self._config.namespace}.query',
             [[self._config.datastore_primary_key, '=', id]],
-            {'force_sql_filters': True}
+            options
         )
         if not instance:
             raise ValidationError(None, f'{self._config.verbose_name} {id} does not exist', errno.ENOENT)
@@ -641,6 +809,7 @@ class CRUDService(ServiceChangeMixin, Service):
                 }, **data)
 
         return dependencies
+
 
 class SharingTaskService(CRUDService):
 
@@ -844,6 +1013,18 @@ class CoreService(Service):
             for i in self.middleware.get_wsclients().values()
         ], filters, options)
 
+    @accepts(Bool('debug_mode'))
+    async def set_debug_mode(self, debug_mode):
+        """
+        Set `debug_mode` for middleware.
+        """
+        conf.debug_mode = debug_mode
+
+    @accepts()
+    @returns(Bool())
+    async def debug_mode_enabled(self):
+        return conf.debug_mode
+
     @private
     def get_tasks(self):
         for task in asyncio.all_tasks(loop=self.middleware.loop):
@@ -869,6 +1050,29 @@ class CoreService(Service):
             i.__encode__() for i in list(self.middleware.jobs.all().values())
         ], filters, options)
         return jobs
+
+    @accepts()
+    @returns(List('websocket_messages', items=[Dict(
+        'websocket_message',
+        Str('type', required=True, enum=['incoming', 'outgoing']),
+        Str('session_id', required=True),
+        Any('message', required=True),
+    )]))
+    def get_websocket_messages(self):
+        """
+        Retrieve last 1000 incoming/outgoing message(s) logged over websocket.
+        """
+        return list(self.middleware.socket_messages_queue)
+
+    @private
+    def jobs_stop_logging(self):
+        for job in self.middleware.jobs.all().values():
+            job.stop_logging()
+
+    @private
+    def jobs_resume_logging(self):
+        for job in self.middleware.jobs.all().values():
+            job.start_logging()
 
     @accepts(Int('id'))
     @job()
@@ -975,7 +1179,6 @@ class CoreService(Service):
                 # For CRUD.do_{update,delete} they need to be accounted
                 # as "item_method", since they are just wrapped.
                 item_method = None
-                filterable_schema = None
                 if is_service_class(svc, CRUDService):
                     """
                     For CRUD the create/update/delete are special.
@@ -1004,7 +1207,7 @@ class CoreService(Service):
                             method = getattr(svc, attr)
                         if method is None:
                             continue
-                    elif attr in ('do_update'):
+                    elif attr in ('do_update',):
                         continue
 
                 if method is None:
@@ -1049,39 +1252,42 @@ class CoreService(Service):
                             exname = '__all__'
                         examples[exname].append(sections[idx + 1])
 
-                accepts = getattr(method, 'accepts', None)
-                if accepts:
-                    accepts = [i.to_json_schema() for i in accepts if not getattr(i, 'hidden', False)]
+                method_schemas = {'accepts': None, 'returns': None}
+                for schema_type in method_schemas:
+                    schema = getattr(method, schema_type, None)
+                    if schema:
+                        schema = [i.to_json_schema() for i in schema if not getattr(i, 'hidden', False)]
 
-                    names = set()
-                    for i in accepts:
-                        names.add(i['_name_'])
+                        names = set()
+                        for i in schema:
+                            names.add(i['_name_'])
 
-                        if i.get('type') == 'object':
-                            for j in i['properties'].values():
-                                names.add(j['_name_'])
+                            if i.get('type') == 'object':
+                                for j in i['properties'].values():
+                                    names.add(j['_name_'])
 
-                    args_descriptions_doc = doc or ''
-                    if attr == 'update':
-                        if do_create := getattr(svc, 'do_create', None):
-                            args_descriptions_doc += "\n" + inspect.getdoc(do_create)
+                        args_descriptions_doc = doc or ''
+                        if attr == 'update':
+                            if do_create := getattr(svc, 'do_create', None):
+                                args_descriptions_doc += "\n" + inspect.getdoc(do_create)
 
-                    args_descriptions = self._cli_args_descriptions(args_descriptions_doc, names)
+                        args_descriptions = self._cli_args_descriptions(args_descriptions_doc, names)
 
-                    for i in accepts:
-                        if not i.get('description') and i['_name_'] in args_descriptions:
-                            i['description'] = args_descriptions[i['_name_']]
+                        for i in schema:
+                            if not i.get('description') and i['_name_'] in args_descriptions:
+                                i['description'] = args_descriptions[i['_name_']]
 
-                        if i.get('type') == 'object':
-                            for j in i['properties'].values():
-                                if not j.get('description') and j['_name_'] in args_descriptions:
-                                    j['description'] = args_descriptions[j['_name_']]
+                            if i.get('type') == 'object':
+                                for j in i['properties'].values():
+                                    if not j.get('description') and j['_name_'] in args_descriptions:
+                                        j['description'] = args_descriptions[j['_name_']]
+
+                    method_schemas[schema_type] = schema
 
                 data['{0}.{1}'.format(name, attr)] = {
                     'description': doc,
                     'cli_description': (doc or '').split('.')[0].replace('\n', ' '),
                     'examples': examples,
-                    'accepts': accepts,
                     'item_method': True if item_method else hasattr(method, '_item_method'),
                     'no_auth_required': hasattr(method, '_no_auth_required'),
                     'filterable': hasattr(method, '_filterable'),
@@ -1096,6 +1302,7 @@ class CoreService(Service):
                     'require_pipes': hasattr(method, '_job') and method._job['check_pipes'] and any(
                         i in method._job['pipes'] for i in ('input', 'output')
                     ),
+                    **method_schemas,
                 }
 
             if is_service_class(svc, CRUDService):
@@ -1103,7 +1310,7 @@ class CoreService(Service):
                 if f'{name}.create' in data:
                     data[f'{name}.query']['filterable_schema'] = data[f'{name}.create']['accepts'][0]
                 else:
-                    data[f'{name}.query']['filterable_schema'] = []
+                    data[f'{name}.query']['filterable_schema'] = None
 
         return data
 
@@ -1221,16 +1428,21 @@ class CoreService(Service):
         Str('method'),
         List('args'),
         Str('filename'),
+        Bool('buffered', default=False),
     )
-    async def download(self, method, args, filename):
+    async def download(self, method, args, filename, buffered):
         """
         Core helper to call a job marked for download.
 
+        Non-`buffered` downloads will allow job to write to pipe as soon as download URL is requested, job will stay
+        blocked meanwhile. `buffered` downloads must wait for job to complete before requesting download URL, job's
+        pipe output will be buffered to ramfs.
+
         Returns the job id and the URL for download.
         """
-        job = await self.middleware.call(method, *args, pipes=Pipes(output=self.middleware.pipe()))
+        job = await self.middleware.call(method, *args, pipes=Pipes(output=self.middleware.pipe(buffered)))
         token = await self.middleware.call('auth.generate_token', 300, {'filename': filename, 'job': job.id})
-        self.middleware.fileapp.register_job(job.id)
+        self.middleware.fileapp.register_job(job.id, buffered)
         return job.id, f'/_download/{job.id}?auth_token={token}'
 
     def __kill_multiprocessing(self):
@@ -1249,12 +1461,15 @@ class CoreService(Service):
         """
         reconfigure_logging()
         self.__kill_multiprocessing()
+        self.middleware.call_sync('core.jobs_resume_logging')
+
         self.middleware.send_event('core.reconfigure_logging', 'CHANGED')
 
     @private
     def stop_logging(self):
         stop_logging()
         self.__kill_multiprocessing()
+        self.middleware.call_sync('core.jobs_stop_logging')
 
         self.middleware.send_event('core.reconfigure_logging', 'CHANGED', fields={'stop': True})
 

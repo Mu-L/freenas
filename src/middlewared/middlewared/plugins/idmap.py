@@ -1,4 +1,5 @@
 import enum
+import asyncio
 import errno
 import os
 import datetime
@@ -162,8 +163,8 @@ class IdmapDomainModel(sa.Model):
     __tablename__ = 'directoryservice_idmap_domain'
 
     id = sa.Column(sa.Integer(), primary_key=True)
-    idmap_domain_name = sa.Column(sa.String(120))
-    idmap_domain_dns_domain_name = sa.Column(sa.String(255), nullable=True)
+    idmap_domain_name = sa.Column(sa.String(120), unique=True)
+    idmap_domain_dns_domain_name = sa.Column(sa.String(255), nullable=True, unique=True)
     idmap_domain_range_low = sa.Column(sa.Integer())
     idmap_domain_range_high = sa.Column(sa.Integer())
     idmap_domain_idmap_backend = sa.Column(sa.String(120), default='rid')
@@ -218,11 +219,15 @@ class IdmapDomainService(CRUDService):
         return (low_range, high_range)
 
     @private
-    async def remove_winbind_idmap_tdb(self):
+    async def snapshot_samba4_dataset(self):
         sysdataset = (await self.middleware.call('systemdataset.config'))['basename']
         ts = str(datetime.datetime.now(datetime.timezone.utc).timestamp())[:10]
         await self.middleware.call('zfs.snapshot.create', {'dataset': f'{sysdataset}/samba4',
                                                            'name': f'wbc-{ts}'})
+
+    @private
+    async def remove_winbind_idmap_tdb(self):
+        await self.snapshot_samba4_dataset()
         try:
             os.remove('/var/db/system/samba4/winbindd_idmap.tdb')
 
@@ -283,7 +288,6 @@ class IdmapDomainService(CRUDService):
 
         while datalen >= 4:
             k = int.from_bytes(data_bytes[:4], byteorder='little') & 0xFFFFFFFF
-            self.logger.debug('%d', k)
             data_bytes = data_bytes[4:]
             datalen = datalen - 4
             k = (k * c1) & 0xFFFFFFFF
@@ -296,7 +300,7 @@ class IdmapDomainService(CRUDService):
         if datalen > 0:
             k = 0
             if datalen >= 3:
-                k = k | int.from_bytes(data_bytes[2], byteorder='little') << 16
+                k = k | data_bytes[2] << 16
             if datalen >= 2:
                 k = k | data_bytes[1] << 8
             if datalen >= 1:
@@ -441,8 +445,9 @@ class IdmapDomainService(CRUDService):
             existing_range = range(i['range_low'], i['range_high'])
             if range(max(existing_range[0], new_range[0]), min(existing_range[-1], new_range[-1]) + 1):
                 verrors.add(f'{schema_name}.range_low',
-                            'new idmap range conflicts with existing range for domain '
-                            f'[{i["name"]}].')
+                            f'new idmap range [{data["range_low"]}-{data["range_high"]}] '
+                            'conflicts with existing range for domain '
+                            f'[{i["name"]}], range: [{i["range_low"]}-{i["range_high"]}].')
 
     @private
     async def validate_options(self, schema_name, data, verrors, check=['MISSING', 'EXTRA']):
@@ -778,6 +783,40 @@ class IdmapDomainService(CRUDService):
             rv = {"id_type": "USER", "id": uid}
 
         return rv
+
+    @private
+    async def id_to_name(self, id, id_type):
+        idtype = IDType[id_type]
+        idmap_timeout = 5.0
+
+        if idtype == IDType.GROUP or idtype == IDType.BOTH:
+            method = "group.get_group_obj"
+            to_check = {"gid": id}
+            key = 'gr_name'
+        elif idtype == IDType.USER:
+            method = "user.get_user_obj"
+            to_check = {"uid": id}
+            key = 'pw_name'
+        else:
+            raise CallError(f"Unsupported id_type: [{idtype.name}]")
+
+        try:
+            ret = await asyncio.wait_for(
+                self.middleware.call(method, to_check),
+                timeout=idmap_timeout
+            )
+            name = ret[key]
+        except asyncio.TimeoutError:
+            self.logger.debug(
+                "timeout encountered while trying to convert %s id %s "
+                "to name. This may indicate significant networking issue.",
+                id_type.lower(), id
+            )
+            name = None
+        except KeyError:
+            name = None
+
+        return name
 
     @private
     async def unixid_to_sid(self, data):

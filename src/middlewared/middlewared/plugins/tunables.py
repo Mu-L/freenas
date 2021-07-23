@@ -1,10 +1,9 @@
 import re
 
-from middlewared.schema import (Bool, Dict, Int, Patch, Str, ValidationErrors,
-                                accepts)
+from middlewared.schema import accepts, Bool, Dict, Int, Patch, returns, Str, ValidationErrors
 from middlewared.service import CRUDService, private
 import middlewared.sqlalchemy as sa
-from middlewared.utils import osc, run
+from middlewared.utils import run
 from middlewared.validators import Match
 
 
@@ -16,10 +15,10 @@ class TunableModel(sa.Model):
     tun_type = sa.Column(sa.String(20), default='loader')
     tun_comment = sa.Column(sa.String(100))
     tun_enabled = sa.Column(sa.Boolean(), default=True)
-    tun_var = sa.Column(sa.String(128))
+    tun_var = sa.Column(sa.String(128), unique=True)
 
 
-TUNABLE_TYPES = ['SYSCTL'] + ([] if osc.IS_LINUX else ['LOADER', 'RC'])
+TUNABLE_TYPES = ['SYSCTL']
 
 
 class TunableService(CRUDService):
@@ -32,6 +31,11 @@ class TunableService(CRUDService):
     def __init__(self, *args, **kwargs):
         super(TunableService, self).__init__(*args, **kwargs)
         self.__default_sysctl = {}
+
+    ENTRY = Patch(
+        'tunable_create', 'tunable_entry',
+        ('add', Int('id')),
+    )
 
     @private
     async def default_sysctl_config(self):
@@ -47,6 +51,10 @@ class TunableService(CRUDService):
             self.__default_sysctl[oid] = value
 
     @accepts()
+    @returns(Dict(
+        'tunable_type_choices',
+        *[Str(k, enum=[k]) for k in TUNABLE_TYPES],
+    ))
     async def tunable_type_choices(self):
         """
         Retrieve tunable type choices supported in the system
@@ -91,14 +99,6 @@ class TunableService(CRUDService):
 
         return await self._get_instance(data['id'])
 
-    @accepts(
-        Int('id'),
-        Patch(
-            'tunable_create',
-            'tunable_update',
-            ('attr', {'update': True})
-        )
-    )
     async def do_update(self, id, data):
         """
         Update Tunable of `id`.
@@ -135,7 +135,6 @@ class TunableService(CRUDService):
 
         return await self.get_instance(id)
 
-    @accepts(Int('id'))
     async def do_delete(self, id):
         """
         Delete Tunable of `id`.

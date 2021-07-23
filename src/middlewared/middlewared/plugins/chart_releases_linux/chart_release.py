@@ -11,7 +11,7 @@ import yaml
 
 from pkg_resources import parse_version
 
-from middlewared.schema import accepts, Dict, Str
+from middlewared.schema import accepts, Bool, Dict, Int, List, Str, returns
 from middlewared.service import CallError, CRUDService, filterable, job, private
 from middlewared.utils import filter_list, get
 from middlewared.validators import Match
@@ -28,6 +28,65 @@ class ChartReleaseService(CRUDService):
         namespace = 'chart.release'
         cli_namespace = 'app.chart_release'
 
+    ENTRY = Dict(
+        'chart_release_entry',
+        Str('name', required=True),
+        Dict('info', additional_attrs=True),
+        Dict('config', additional_attrs=True),
+        List('hooks'),
+        Int('version', required=True, description='Version of chart release'),
+        Str('namespace', required=True),
+        Dict(
+            'chart_metadata',
+            Str('name', required=True, description='Name of application'),
+            Str('version', required=True, description='Version of application'),
+            Str('latest_chart_version', required=True, description='Latest available version of application'),
+            additional_attrs=True,
+        ),
+        Str('id', required=True),
+        Str('catalog', required=True),
+        Str('catalog_train', required=True),
+        Str('path', required=True),
+        Str('dataset', required=True),
+        Str('status', required=True),
+        List('used_ports', items=[
+            Dict(
+                'port',
+                Int('port', required=True),
+                Str('protocol', required=True),
+            )
+        ], required=True),
+        Dict(
+            'pod_status',
+            Int('available', required=True),
+            Int('desired', required=True),
+            required=True,
+        ),
+        Bool('update_available', required=True),
+        Str('human_version', required=True, description='Human friendly version identifier for chart release'),
+        Str(
+            'human_latest_version', required=True,
+            description='Human friendly latest available version identifier for chart release'
+        ),
+        Bool(
+            'container_images_update_available', required=True,
+            description='Will be set when any image(s) being used in the chart release has a newer version available'
+        ),
+        Dict('portals', additional_attrs=True),
+        Dict('chart_schema', null=True, additional_attrs=True),
+        Dict('history', additional_attrs=True),
+        Dict(
+            'resources',
+            Dict('storage_class', additional_attrs=True),
+            List('persistent_volumes'),
+            List('host_path_volumes'),
+            Dict('container_images', additional_attrs=True),
+            List('truenas_certificates', items=[Int('certificate_id')]),
+            List('truenas_certificate_authorities', items=[Int('certificate_authority_id')]),
+            *[List(r.value) for r in Resources],
+        ),
+    )
+
     @filterable
     async def query(self, filters, options):
         """
@@ -42,7 +101,8 @@ class ChartReleaseService(CRUDService):
         `query-options.extra.include_chart_schema` is a boolean when set will retrieve the schema being used by
         the chart release in question.
         """
-        if not await self.middleware.call('service.started', 'kubernetes'):
+        k8s_config = await self.middleware.call('kubernetes.config')
+        if not await self.middleware.call('service.started', 'kubernetes') or not k8s_config['dataset']:
             # We use filter_list here to ensure that `options` are respected, options like get: true
             return filter_list([], filters, options)
 
@@ -59,25 +119,15 @@ class ChartReleaseService(CRUDService):
             for train in catalog['trains']:
                 train_data = {}
                 for catalog_item in catalog['trains'][train]:
-                    versions = {
-                        k: v for k, v in catalog['trains'][train][catalog_item]['versions'].items() if v['healthy']
-                    }
-                    max_version = max(
-                        [parse_version(v) for v in versions],
-                        default=parse_version('0.0.0')
-                    )
-                    app_version = None
-                    if str(max_version) in versions:
-                        app_version = versions[str(max_version)]['chart_metadata'].get('appVersion')
-
+                    max_version = catalog['trains'][train][catalog_item]['latest_version'] or '0.0.0'
+                    app_version = catalog['trains'][train][catalog_item]['latest_app_version'] or '0.0.0'
                     train_data[catalog_item] = {
-                        'chart_version': max_version,
+                        'chart_version': parse_version(max_version),
                         'app_version': app_version,
                     }
 
                 update_catalog_config[catalog['label']][train] = train_data
 
-        k8s_config = await self.middleware.call('kubernetes.config')
         k8s_node_ip = await self.middleware.call('kubernetes.node_ip')
         options = options or {}
         extra = copy.deepcopy(options.get('extra', {}))
@@ -339,7 +389,7 @@ class ChartReleaseService(CRUDService):
     async def host_path_volumes(self, pods):
         host_path_volumes = []
         for pod in pods:
-            for volume in filter(lambda v: v.get('host_path'), pod['spec']['volumes']):
+            for volume in filter(lambda v: v.get('host_path'), pod['spec']['volumes'] or []):
                 host_path_volumes.append(copy.deepcopy(volume))
         return host_path_volumes
 
@@ -395,29 +445,21 @@ class ChartReleaseService(CRUDService):
         if await self.query([['id', '=', data['release_name']]]):
             raise CallError(f'Chart release with {data["release_name"]} already exists.', errno=errno.EEXIST)
 
-        catalog = await self.middleware.call(
-            'catalog.query', [['id', '=', data['catalog']]], {'extra': {'item_details': True}}
-        )
-        if not catalog:
-            raise CallError(f'Unable to locate {data["catalog"]!r} catalog', errno=errno.ENOENT)
-        else:
-            catalog = catalog[0]
-        if data['train'] not in catalog['trains']:
-            raise CallError(f'Unable to locate "{data["train"]}" catalog train.', errno=errno.ENOENT)
-        if data['item'] not in catalog['trains'][data['train']]:
-            raise CallError(f'Unable to locate "{data["item"]}" catalog item.', errno=errno.ENOENT)
-
+        catalog = await self.middleware.call('catalog.get_instance', data['catalog'])
+        item_details = await self.middleware.call('catalog.get_item_details', data['item'], {
+            'catalog': data['catalog'],
+            'train': data['train'],
+        })
         version = data['version']
         if version == 'latest':
             version = await self.middleware.call(
-                'chart.release.get_latest_version_from_item_versions',
-                catalog['trains'][data['train']][data['item']]['versions']
+                'chart.release.get_latest_version_from_item_versions', item_details['versions']
             )
 
-        if version not in catalog['trains'][data['train']][data['item']]['versions']:
+        if version not in item_details['versions']:
             raise CallError(f'Unable to locate "{data["version"]}" catalog item version.', errno=errno.ENOENT)
 
-        item_details = catalog['trains'][data['train']][data['item']]['versions'][version]
+        item_details = item_details['versions'][version]
         await self.middleware.call('catalog.version_supported_error_check', item_details)
 
         k8s_config = await self.middleware.call('kubernetes.config')
@@ -479,15 +521,15 @@ class ChartReleaseService(CRUDService):
                 'isInstall': True,
             })
 
+            await self.middleware.call(
+                'chart.release.create_update_storage_class_for_chart_release',
+                data['release_name'], os.path.join(release_ds, 'volumes')
+            )
+
             # We will install the chart now and force the installation in an ix based namespace
             # https://github.com/helm/helm/issues/5465#issuecomment-473942223
             await self.middleware.call(
                 'chart.release.helm_action', data['release_name'], chart_path, new_values, 'install'
-            )
-
-            await self.middleware.call(
-                'chart.release.create_update_storage_class_for_chart_release',
-                data['release_name'], os.path.join(release_ds, 'volumes')
             )
         except Exception:
             # Do a rollback here
@@ -522,6 +564,7 @@ class ChartReleaseService(CRUDService):
         create the chart release.
         """
         release = await self.get_instance(chart_release)
+        release_orig = copy.deepcopy(release)
         chart_path = os.path.join(release['path'], 'charts', release['chart_metadata']['version'])
         if not os.path.exists(chart_path):
             raise CallError(
@@ -536,7 +579,7 @@ class ChartReleaseService(CRUDService):
         # Why this is not dangerous is because the defaults will be added only if they are not present/configured for
         # the chart release.
         config, context = await self.normalise_and_validate_values(
-            version_details, config, False, release['dataset'], release,
+            version_details, config, False, release['dataset'], release_orig,
         )
 
         job.set_progress(25, 'Initial Validation complete')
@@ -608,6 +651,7 @@ class ChartReleaseService(CRUDService):
                 raise CallError(f'Failed to {tn_action} chart release: {stderr.decode()}')
 
     @accepts(Str('release_name'))
+    @returns(ENTRY)
     @job(lock=lambda args: f'chart_release_redeploy_{args[0]}')
     async def redeploy(self, job, release_name):
         """

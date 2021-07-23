@@ -2,7 +2,8 @@ import josepy as jose
 import json
 import requests
 
-from middlewared.schema import Bool, Dict, Int, Str, ValidationErrors
+from middlewared.plugins.acme_protocol_.authenticators.factory import auth_factory
+from middlewared.schema import Bool, Dict, Int, Patch, Str, ValidationErrors
 from middlewared.service import accepts, CallError, CRUDService, private
 import middlewared.sqlalchemy as sa
 
@@ -19,7 +20,7 @@ class ACMERegistrationModel(sa.Model):
 
     id = sa.Column(sa.Integer(), primary_key=True)
     uri = sa.Column(sa.String(200))
-    directory = sa.Column(sa.String(200))
+    directory = sa.Column(sa.String(200), unique=True)
     tos = sa.Column(sa.String(200))
     new_account_uri = sa.Column(sa.String(200))
     new_nonce_uri = sa.Column(sa.String(200))
@@ -85,7 +86,7 @@ class ACMERegistrationService(CRUDService):
         """
         Register with ACME Server
 
-        Create a regisration for a specific ACME Server registering root user with it
+        Create a registration for a specific ACME Server registering root user with it
 
         `acme_directory_uri` is a directory endpoint for any ACME Server
 
@@ -202,7 +203,7 @@ class ACMEDNSAuthenticatorModel(sa.Model):
 
     id = sa.Column(sa.Integer(), primary_key=True)
     authenticator = sa.Column(sa.String(64))
-    name = sa.Column(sa.String(64))
+    name = sa.Column(sa.String(64), unique=True)
     attributes = sa.Column(sa.JSON(encrypted=True))
 
 
@@ -213,9 +214,29 @@ class DNSAuthenticatorService(CRUDService):
         datastore = 'system.acmednsauthenticator'
         cli_namespace = 'system.acme.dns_auth'
 
+    ENTRY = Dict(
+        'acme_dns_authenticator_entry',
+        Int('id', required=True),
+        Str(
+            'authenticator', enum=[authenticator for authenticator in auth_factory.get_authenticators()],
+            required=True
+        ),
+        Dict(
+            'attributes',
+            additional_attrs=True,
+            description='Specific attributes of each `authenticator`'
+        ),
+        Str('name', description='User defined name of authenticator', required=True),
+    )
+
     @private
-    async def common_validation(self, data, schema_name):
+    async def common_validation(self, data, schema_name, old=None):
         verrors = ValidationErrors()
+        filters = [['name', '!=', old['name']]] if old else []
+        filters.append(['name', '=', data['name']])
+        if await self.query(filters):
+            verrors.add(f'{schema_name}.name', 'Specified name is already in use')
+
         if data['authenticator'] not in await self.middleware.call('acme.dns.authenticator.get_authenticator_schemas'):
             verrors.add(
                 f'{schema_name}.authenticator',
@@ -227,14 +248,6 @@ class DNSAuthenticatorService(CRUDService):
 
         verrors.check()
 
-    @accepts(
-        Dict(
-            'dns_authenticator_create',
-            Str('authenticator', required=True),
-            Str('name', required=True),
-            Dict('attributes', additional_attrs=True, required=True)
-        )
-    )
     async def do_create(self, data):
         """
         Create a DNS Authenticator
@@ -273,11 +286,13 @@ class DNSAuthenticatorService(CRUDService):
 
     @accepts(
         Int('id'),
-        Dict(
+        Patch(
+            'acme_dns_authenticator_entry',
             'dns_authenticator_update',
-            Str('name'),
-            Dict('attributes', additional_attrs=True)
-        )
+            ('rm', {'name': 'id'}),
+            ('rm', {'name': 'authenticator'}),
+            ('attr', {'update': True}),
+        ),
     )
     async def do_update(self, id, data):
         """
@@ -308,7 +323,7 @@ class DNSAuthenticatorService(CRUDService):
         new = old.copy()
         new.update(data)
 
-        await self.common_validation(new, 'dns_authenticator_update')
+        await self.common_validation(new, 'dns_authenticator_update', old)
 
         await self.middleware.call(
             'datastore.update',
@@ -319,9 +334,6 @@ class DNSAuthenticatorService(CRUDService):
 
         return await self._get_instance(id)
 
-    @accepts(
-        Int('id', required=True)
-    )
     async def do_delete(self, id):
         """
         Delete DNS Authenticator of `id`

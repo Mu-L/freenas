@@ -2,7 +2,7 @@ from copy import deepcopy
 from itertools import chain
 
 from middlewared.service_exception import ValidationErrors
-from middlewared.schema import Bool, Cron, Dict, HostPath, Int, IPAddr, List, Path, Str
+from middlewared.schema import Bool, Cron, Dict, HostPath, Int, IPAddr, List, NOT_PROVIDED, Path, Str
 from middlewared.validators import Match, Range
 
 
@@ -38,22 +38,28 @@ def update_conditional_defaults(dict_obj, variable_details):
     return dict_obj
 
 
-def get_schema(variable_details, update):
+def get_schema(variable_details, update, existing=NOT_PROVIDED):
     schema_details = variable_details['schema']
     schema_class = mapping[schema_details['type']]
+    cur_val = existing.get(variable_details['variable'], NOT_PROVIDED) if isinstance(existing, dict) else NOT_PROVIDED
 
     # Validation is ensured at chart level to ensure that we don't have enum for say boolean
     obj_kwargs = {k: schema_details[k] for k in filter(
         lambda k: k in schema_details,
         ('required', 'default', 'private', 'ipv4', 'ipv6', 'cidr', 'null', 'additional_attrs', 'editable')
     )}
+    if schema_details.get('immutable') and cur_val is not NOT_PROVIDED:
+        obj_kwargs['default'] = cur_val
+        obj_kwargs['editable'] = False
 
     if schema_class not in (Cron, Dict):
         obj = schema_class(variable_details['variable'], **obj_kwargs)
     else:
         obj = schema_class(
             variable_details['variable'],
-            *list(chain.from_iterable(get_schema(var, update) for var in schema_details.get('attrs', []))),
+            *list(chain.from_iterable(
+                get_schema(var, update, cur_val or NOT_PROVIDED) for var in schema_details.get('attrs', [])
+            )),
             update=update, **obj_kwargs
         )
         if schema_class == Dict:
@@ -79,7 +85,9 @@ def get_schema(variable_details, update):
     if schema_class == List:
         obj.items = list(chain.from_iterable(get_schema(i, update) for i in schema_details['items']))
     elif 'subquestions' in schema_details:
-        result.extend(list(chain.from_iterable(get_schema(i, update) for i in schema_details['subquestions'])))
+        result.extend(list(chain.from_iterable(
+            get_schema(i, update, existing) for i in schema_details['subquestions']
+        )))
 
     result.insert(0, obj)
     return result

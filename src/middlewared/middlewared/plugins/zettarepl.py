@@ -1,6 +1,6 @@
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, time as _time, timedelta
 import errno
 import logging
 import multiprocessing
@@ -14,7 +14,6 @@ import socket
 import threading
 import time
 import types
-import subprocess
 
 import humanfriendly
 import paramiko.ssh_exception
@@ -99,6 +98,10 @@ def zettarepl_schedule(schedule):
     schedule = {k.replace("_", "-"): v for k, v in schedule.items()}
     schedule["day-of-month"] = schedule.pop("dom")
     schedule["day-of-week"] = schedule.pop("dow")
+    for k in ["begin", "end"]:
+        if isinstance(schedule[k], _time):
+            schedule[k] = str(schedule[k])[:5]
+
     return schedule
 
 
@@ -462,9 +465,12 @@ class ZettareplService(Service):
             )
 
         if data_progress_message is not None:
+            # Destination can result being larger than source
+            # Do this to avoid displaying progress like "[total 11.11 TiB out of 11.04 TiB]"
+            total = max(data_progress_message.dst_size, data_progress_message.src_size)
             text += (
                 f" [total {humanfriendly.format_size(data_progress_message.dst_size, binary=True)} of "
-                f"{humanfriendly.format_size(data_progress_message.src_size, binary=True)}]"
+                f"{humanfriendly.format_size(total, binary=True)}]"
             )
 
         job.set_progress(progress, text)
@@ -576,21 +582,9 @@ class ZettareplService(Service):
                 hold_tasks[f"periodic_snapshot_task_{periodic_snapshot_task['id']}"] = hold_task_reason
                 continue
 
-            periodic_snapshot_tasks[f"task_{periodic_snapshot_task['id']}"] = {
-                "dataset": periodic_snapshot_task["dataset"],
-
-                "recursive": periodic_snapshot_task["recursive"],
-                "exclude": periodic_snapshot_task["exclude"],
-
-                "lifetime": lifetime_iso8601(periodic_snapshot_task["lifetime_value"],
-                                             periodic_snapshot_task["lifetime_unit"]),
-
-                "naming-schema": periodic_snapshot_task["naming_schema"],
-
-                "schedule": zettarepl_schedule(periodic_snapshot_task["schedule"]),
-
-                "allow-empty": periodic_snapshot_task["allow_empty"],
-            }
+            periodic_snapshot_tasks[f"task_{periodic_snapshot_task['id']}"] = self.periodic_snapshot_task_definition(
+                periodic_snapshot_task,
+            )
 
         replication_tasks = {}
         for replication_task in await self.middleware.call("replication.query", [["enabled", "=", True]]):
@@ -610,6 +604,7 @@ class ZettareplService(Service):
         definition = {
             "max-parallel-replication-tasks": config["max_parallel_replication_tasks"],
             "timezone": timezone,
+            "use-removal-dates": True,
             "periodic-snapshot-tasks": periodic_snapshot_tasks,
             "replication-tasks": replication_tasks,
         }
@@ -627,6 +622,23 @@ class ZettareplService(Service):
         }
 
         return definition, hold_tasks
+
+    def periodic_snapshot_task_definition(self, periodic_snapshot_task):
+        return {
+            "dataset": periodic_snapshot_task["dataset"],
+
+            "recursive": periodic_snapshot_task["recursive"],
+            "exclude": periodic_snapshot_task["exclude"],
+
+            "lifetime": lifetime_iso8601(periodic_snapshot_task["lifetime_value"],
+                                         periodic_snapshot_task["lifetime_unit"]),
+
+            "naming-schema": periodic_snapshot_task["naming_schema"],
+
+            "schedule": zettarepl_schedule(periodic_snapshot_task["schedule"]),
+
+            "allow-empty": periodic_snapshot_task["allow_empty"],
+        }
 
     async def _replication_task_definition(self, pools, replication_task):
         if replication_task["direction"] == "PUSH":
@@ -682,6 +694,7 @@ class ZettareplService(Service):
             "auto": replication_task["auto"],
             "only-matching-schedule": replication_task["only_matching_schedule"],
             "allow-from-scratch": replication_task["allow_from_scratch"],
+            "only-from-scratch": replication_task.get("only_from_scratch", False),
             "readonly": replication_task["readonly"].lower(),
             "hold-pending-snapshots": replication_task["hold_pending_snapshots"],
             "retention-policy": replication_task["retention_policy"].lower(),
@@ -702,6 +715,8 @@ class ZettareplService(Service):
             definition["naming-schema"] = replication_task["naming_schema"]
         if replication_task["also_include_naming_schema"]:
             definition["also-include-naming-schema"] = replication_task["also_include_naming_schema"]
+        if replication_task["name_regex"]:
+            definition["name-regex"] = replication_task["name_regex"]
         if replication_task["schedule"] is not None:
             definition["schedule"] = zettarepl_schedule(replication_task["schedule"])
         if replication_task["restrict_schedule"] is not None:
@@ -709,6 +724,14 @@ class ZettareplService(Service):
         if replication_task["lifetime_value"] is not None and replication_task["lifetime_unit"] is not None:
             definition["lifetime"] = lifetime_iso8601(replication_task["lifetime_value"],
                                                       replication_task["lifetime_unit"])
+        if replication_task["lifetimes"]:
+            definition["lifetimes"] = {
+                f"lifetime_{i}": {
+                    "schedule": zettarepl_schedule(lifetime["schedule"]),
+                    "lifetime": lifetime_iso8601(lifetime["lifetime_value"], lifetime["lifetime_unit"]),
+                }
+                for i, lifetime in enumerate(replication_task["lifetimes"])
+            }
         if replication_task["compression"] is not None:
             definition["compression"] = replication_task["compression"].lower()
         if replication_task["speed_limit"] is not None:

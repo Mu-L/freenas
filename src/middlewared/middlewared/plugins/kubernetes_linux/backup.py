@@ -6,7 +6,7 @@ import shutil
 from datetime import datetime
 
 from middlewared.client.ejson import JSONEncoder
-from middlewared.schema import Str
+from middlewared.schema import Dict, Str, returns
 from middlewared.service import accepts, CallError, job, private, Service
 
 from .utils import BACKUP_NAME_PREFIX, UPDATE_BACKUP_PREFIX
@@ -17,6 +17,7 @@ class KubernetesService(Service):
     @accepts(
         Str('backup_name', null=True, default=None)
     )
+    @returns(Str('backup_name'))
     @job(lock='chart_releases_backup')
     def backup_chart_releases(self, job, backup_name):
         """
@@ -87,6 +88,7 @@ class KubernetesService(Service):
         return name
 
     @accepts()
+    @returns(Dict('backups', additional_attrs=True))
     def list_backups(self):
         """
         List existing chart releases backups.
@@ -131,6 +133,7 @@ class KubernetesService(Service):
         return backups
 
     @accepts(Str('backup_name'))
+    @returns()
     def delete_backup(self, backup_name):
         """
         Delete `backup_name` chart releases backup.
@@ -150,6 +153,10 @@ class KubernetesService(Service):
 
 
 async def post_system_update_hook(middleware):
+    if not (await middleware.call('kubernetes.config'))['dataset']:
+        # If k8s is not configured, there is nothing to backup
+        return
+
     backups = [
         v for k, v in (await middleware.call('kubernetes.list_backups')).items()
         if k.startswith(UPDATE_BACKUP_PREFIX)

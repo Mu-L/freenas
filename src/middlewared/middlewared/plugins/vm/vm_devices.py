@@ -4,7 +4,7 @@ import re
 
 import middlewared.sqlalchemy as sa
 
-from middlewared.schema import accepts, Bool, Dict, Error, Int, Patch, Str
+from middlewared.schema import accepts, Bool, Dict, Error, Int, Patch, returns, Str
 from middlewared.service import CallError, CRUDService, private, ValidationErrors
 from middlewared.utils import osc, run
 from middlewared.async_validators import check_path_resides_within_volume
@@ -36,6 +36,11 @@ class VMDeviceService(CRUDService):
         'DISPLAY': DISPLAY.schema,
     }
 
+    ENTRY = Patch(
+        'vmdevice_create', 'vm_device_entry',
+        ('add', Int('id')),
+    )
+
     class Config:
         namespace = 'vm.device'
         datastore = 'vm.device'
@@ -66,6 +71,7 @@ class VMDeviceService(CRUDService):
         return device
 
     @accepts()
+    @returns(Dict(additional_attrs=True))
     def nic_attach_choices(self):
         """
         Available choices for NIC Attach attribute.
@@ -73,6 +79,7 @@ class VMDeviceService(CRUDService):
         return self.middleware.call_sync('interface.choices', {'exclude': ['epair', 'tap', 'vnet']})
 
     @accepts()
+    @returns(Dict(additional_attrs=True))
     async def bind_choices(self):
         """
         Available choices for Bind attribute.
@@ -147,11 +154,6 @@ class VMDeviceService(CRUDService):
 
         return await self.get_instance(id)
 
-    @accepts(Int('id'), Patch(
-        'vmdevice_create',
-        'vmdevice_update',
-        ('attr', {'update': True}),
-    ))
     async def do_update(self, id, data):
         """
         Update a VM device of `id`.

@@ -24,7 +24,7 @@ from middlewared.alert.base import AlertCategory, AlertClass, AlertLevel, Simple
 from middlewared.plugins.disk_.overprovision_base import CanNotBeOverprovisionedException
 from middlewared.plugins.zfs import ZFSSetPropertyError
 from middlewared.schema import (
-    accepts, Attribute, Bool, Cron, Dict, EnumMixin, Int, List, Patch, Str, UnixPerm, Any, Ref,
+    accepts, Attribute, Bool, Cron, Dict, EnumMixin, Int, List, Patch, Str, UnixPerm, Any, Ref, returns, NOT_PROVIDED,
 )
 from middlewared.service import (
     ConfigService, filterable, item_method, job, pass_app, private, CallError, CRUDService, ValidationErrors, periodic
@@ -43,6 +43,9 @@ GELI_KEYPATH = '/data/geli'
 
 RE_HISTORY_ZPOOL_SCRUB = re.compile(r'^([0-9\.\:\-]{19})\s+zpool scrub', re.MULTILINE)
 RE_HISTORY_ZPOOL_CREATE = re.compile(r'^([0-9\.\:\-]{19})\s+zpool create', re.MULTILINE)
+ZFS_CHECKSUM_CHOICES = [
+    'ON', 'OFF', 'FLETCHER2', 'FLETCHER4', 'SHA256', 'SHA512', 'SKEIN', 'EDONR',
+]
 ZFS_ENCRYPTION_ALGORITHM_CHOICES = [
     'AES-128-CCM', 'AES-192-CCM', 'AES-256-CCM', 'AES-128-GCM', 'AES-192-GCM', 'AES-256-GCM'
 ]
@@ -76,24 +79,28 @@ class ZFSKeyFormat(enum.Enum):
 
 
 class Inheritable(EnumMixin, Attribute):
-    def __init__(self, *args, **kwargs):
-        self.value = kwargs.pop('value')
-        super(Inheritable, self).__init__(*args, **kwargs)
+    def __init__(self, schema, **kwargs):
+        self.schema = schema
+        if not self.schema.has_default and 'default' not in kwargs and kwargs.pop('has_default', True):
+            kwargs['default'] = 'INHERIT'
+        super(Inheritable, self).__init__(self.schema.name, **kwargs)
 
     def clean(self, value):
         if value == 'INHERIT':
             return value
+        elif value is NOT_PROVIDED and self.has_default:
+            return copy.deepcopy(self.default)
 
-        return self.value.clean(value)
+        return self.schema.clean(value)
 
     def validate(self, value):
         if value == 'INHERIT':
             return
 
-        return self.value.validate(value)
+        return self.schema.validate(value)
 
     def to_json_schema(self, parent=None):
-        schema = self.value.to_json_schema(parent)
+        schema = self.schema.to_json_schema(parent)
         type_schema = schema.pop('type')
         schema['nullable'] = 'null' in type_schema
         if schema['nullable']:
@@ -138,6 +145,15 @@ class PoolResilverService(ConfigService):
         datastore_extend = 'pool.resilver.resilver_extend'
         cli_namespace = 'storage.resilver'
 
+    ENTRY = Dict(
+        'pool_resilver_entry',
+        Int('id', required=True),
+        Str('begin', validators=[Time()], required=True),
+        Str('end', validators=[Time()], required=True),
+        Bool('enabled', required=True),
+        List('weekday', required=True, items=[Int('weekday', validators=[Range(min=1, max=7)])])
+    )
+
     @private
     async def resilver_extend(self, data):
         data['begin'] = data['begin'].strftime('%H:%M')
@@ -168,15 +184,6 @@ class PoolResilverService(ConfigService):
 
         return verrors, data
 
-    @accepts(
-        Dict(
-            'pool_resilver',
-            Str('begin', validators=[Time()]),
-            Str('end', validators=[Time()]),
-            Bool('enabled'),
-            List('weekday', items=[Int('weekday', validators=[Range(min=1, max=7)])])
-        )
-    )
     async def do_update(self, data):
         """
         Configure Pool Resilver Priority.
@@ -235,7 +242,7 @@ class PoolModel(sa.Model):
     __tablename__ = 'storage_volume'
 
     id = sa.Column(sa.Integer(), primary_key=True)
-    vol_name = sa.Column(sa.String(120))
+    vol_name = sa.Column(sa.String(120), unique=True)
     vol_guid = sa.Column(sa.String(50))
     vol_encrypt = sa.Column(sa.Integer(), default=0)
     vol_encryptkey = sa.Column(sa.String(50))
@@ -247,7 +254,7 @@ class EncryptedDiskModel(sa.Model):
     id = sa.Column(sa.Integer(), primary_key=True)
     encrypted_volume_id = sa.Column(sa.ForeignKey('storage_volume.id', ondelete='CASCADE'))
     encrypted_disk_id = sa.Column(sa.ForeignKey('storage_disk.disk_identifier', ondelete='SET NULL'), nullable=True)
-    encrypted_provider = sa.Column(sa.String(120))
+    encrypted_provider = sa.Column(sa.String(120), unique=True)
 
 
 class PoolService(CRUDService):
@@ -260,6 +267,62 @@ class PoolService(CRUDService):
         datastore_prefix = 'vol_'
         event_send = False
         cli_namespace = 'storage.pool'
+
+    ENTRY = Dict(
+        'pool_entry',
+        Int('id', required=True),
+        Str('name', required=True),
+        Str('guid', required=True),
+        Int('encrypt', required=True),
+        Str('encryptkey', required=True),
+        Str('encryptkey_path', null=True, required=True),
+        Bool('is_decrypted', required=True),
+        Str('status', required=True),
+        Str('path', required=True),
+        Dict(
+            'scan',
+            additional_attrs=True,
+            required=True,
+            null=True,
+            example={
+                'function': None,
+                'state': None,
+                'start_time': None,
+                'end_time': None,
+                'percentage': None,
+                'bytes_to_process': None,
+                'bytes_processed': None,
+                'bytes_issued': None,
+                'pause': None,
+                'errors': None,
+                'total_secs_left': None,
+            }
+        ),
+        Bool('healthy', required=True),
+        Str('status_detail', required=True, null=True),
+        Dict(
+            'autotrim',
+            required=True,
+            additional_attrs=True,
+            example={
+                'parsed': 'off',
+                'rawvalue': 'off',
+                'source': 'DEFAULT',
+                'value': 'off',
+            }
+        ),
+        Dict(
+            'topology',
+            List('data', required=True),
+            List('log', required=True),
+            List('cache', required=True),
+            List('spare', required=True),
+            List('special', required=True),
+            List('dedup', required=True),
+            required=True,
+            null=True,
+        )
+    )
 
     @item_method
     @accepts(
@@ -291,11 +354,13 @@ class PoolService(CRUDService):
         )
 
     @accepts(List('types', items=[Str('type', enum=['FILESYSTEM', 'VOLUME'])], default=['FILESYSTEM', 'VOLUME']))
+    @returns(List(items=[Str('filesystem_name')]))
     async def filesystem_choices(self, types):
         """
         Returns all available datasets, except the following:
             1. system datasets
             2. glusterfs datasets
+            3. application(s) internal datasets
 
         .. examples(websocket)::
 
@@ -324,16 +389,15 @@ class PoolService(CRUDService):
             y['name'] for y in await self.middleware.call(
                 'zfs.dataset.query',
                 [
-                    ('name', 'rnin', '.glusterfs'),
-                    ('name', 'rnin', '.system'),
                     ('pool', 'in', vol_names),
                     ('type', 'in', types),
-                ],
-                {'extra': {'retrieve_properties': False}},
+                ] + await self.middleware.call('pool.dataset.internal_datasets_filters'),
+                {'extra': {'retrieve_properties': False}, 'order_by': ['name']},
             )
         ]
 
     @accepts(Int('id', required=True))
+    @returns(Bool('pool_is_upgraded'))
     @item_method
     async def is_upgraded(self, oid):
         """
@@ -382,6 +446,7 @@ class PoolService(CRUDService):
             return False
 
     @accepts(Int('id'))
+    @returns(Bool('upgraded'))
     @item_method
     async def upgrade(self, oid):
         """
@@ -493,22 +558,11 @@ class PoolService(CRUDService):
                 },
             })
 
-        if osc.IS_FREEBSD and pool['encrypt'] > 0:
-            if zpool:
-                pool['is_decrypted'] = True
-            else:
-                decrypted = True
-                for ed in self.middleware.call_sync(
-                    'datastore.query', 'storage.encrypteddisk', [('encrypted_volume', '=', pool['id'])]
-                ):
-                    if not os.path.exists(f'/dev/{ed["encrypted_provider"]}.eli'):
-                        decrypted = False
-                        break
-                pool['is_decrypted'] = decrypted
-            pool['encryptkey_path'] = os.path.join(GELI_KEYPATH, f'{pool["encryptkey"]}.key')
-        else:
-            pool['encryptkey_path'] = None
-            pool['is_decrypted'] = True
+        # Let's keep below keys until api 2.1 to keep backwards compatibility
+        pool.update({
+            'encryptkey_path': None,
+            'is_decrypted': True,
+        })
         return pool
 
     @accepts(Dict(
@@ -516,6 +570,7 @@ class PoolService(CRUDService):
         Str('name', required=True),
         Bool('encryption', default=False),
         Str('deduplication', enum=[None, 'ON', 'VERIFY', 'OFF'], default=None, null=True),
+        Str('checksum', enum=[None] + ZFS_CHECKSUM_CHOICES, default=None, null=True),
         Dict(
             'encryption_options',
             Bool('generate_key', default=False),
@@ -698,6 +753,9 @@ class PoolService(CRUDService):
         if dedup:
             fsoptions['dedup'] = dedup.lower()
 
+        if data['checksum'] is not None:
+            fsoptions['checksum'] = data['checksum'].lower()
+
         cachefile_dir = os.path.dirname(ZPOOL_CACHE_FILE)
         if not os.path.isdir(cachefile_dir):
             os.makedirs(cachefile_dir)
@@ -801,6 +859,7 @@ class PoolService(CRUDService):
         ('rm', {'name': 'encryption'}),
         ('rm', {'name': 'encryption_options'}),
         ('rm', {'name': 'deduplication'}),
+        ('rm', {'name': 'checksum'}),
         ('edit', {'name': 'topology', 'method': lambda x: setattr(x, 'update', True)}),
     ))
     @job(lock='pool_createupdate')
@@ -982,48 +1041,27 @@ class PoolService(CRUDService):
 
     @item_method
     @accepts(Int('id', required=False, default=None, null=True))
+    @returns(List('pool_disks', items=[Str('disk')]))
     async def get_disks(self, oid):
         """
         Get all disks in use by pools.
         If `id` is provided only the disks from the given pool `id` will be returned.
         """
         filters = []
+        disks = []
         if oid:
             filters.append(('id', '=', oid))
         for pool in await self.query(filters):
             if pool['is_decrypted'] and pool['status'] != 'OFFLINE':
-                for i in await self.middleware.call('zfs.pool.get_disks', pool['name']):
-                    yield i
-            elif osc.IS_FREEBSD:
-                for encrypted_disk in await self.middleware.call(
-                    'datastore.query',
-                    'storage.encrypteddisk',
-                    [('encrypted_volume', '=', pool['id'])]
-                ):
-                    # Use provider and not disk because a disk is not a guarantee
-                    # to point to correct device if its locked and its not in the system
-                    # (e.g. temporarily). See #50291
-                    prov = encrypted_disk["encrypted_provider"]
-                    if not prov:
-                        continue
-
-                    disk_name = await self.middleware.call('disk.label_to_disk', prov)
-                    if not disk_name:
-                        continue
-
-                    disk = await self.middleware.call('disk.query', [('name', '=', disk_name)])
-                    if not disk:
-                        continue
-                    disk = disk[0]
-
-                    if os.path.exists(os.path.join("/dev", disk['devname'])):
-                        yield disk['devname']
+                disks.extend(list(await self.middleware.call('zfs.pool.get_disks', pool['name'])))
+        return disks
 
     @item_method
     @accepts(Int('id'), Dict(
         'options',
         Str('label', required=True),
     ))
+    @returns(Bool('detached'))
     async def detach(self, oid, options):
         """
         Detach a disk from pool of id `id`.
@@ -1077,6 +1115,7 @@ class PoolService(CRUDService):
         'options',
         Str('label', required=True),
     ))
+    @returns(Bool('offline_successful'))
     async def offline(self, oid, options):
         """
         Offline a disk from pool of id `id`.
@@ -1128,6 +1167,7 @@ class PoolService(CRUDService):
         'options',
         Str('label', required=True),
     ))
+    @returns(Bool('online_successful'))
     async def online(self, oid, options):
         """
         Online a disk from pool of id `id`.
@@ -1177,7 +1217,9 @@ class PoolService(CRUDService):
         'options',
         Str('label', required=True),
     ))
-    async def remove(self, oid, options):
+    @returns()
+    @job(lock=lambda args: f'{args[0]}_remove')
+    async def remove(self, job, oid, options):
         """
         Remove a disk from pool of id `id`.
 
@@ -1211,10 +1253,15 @@ class PoolService(CRUDService):
         if not found:
             verrors.add('options.label', f'Label {options["label"]} not found on this pool.')
 
-        if verrors:
-            raise verrors
+        verrors.check()
 
+        job.set_progress(20, f'Initiating removal of {options["label"]!r} ZFS device')
         await self.middleware.call('zfs.pool.remove', pool['name'], found[1]['guid'])
+        job.set_progress(40, 'Waiting for removal of ZFS device to complete')
+        # We would like to wait not for the removal to actually complete for cases where the removal might not
+        # be synchronous like removing top level vdevs except for slog and l2arc
+        await self.middleware.call('zfs.pool.wait', pool['name'], {'activity_type': 'REMOVE'})
+        job.set_progress(60, 'Removal of ZFS device complete')
 
         if found[1]['type'] != 'DISK':
             disk_paths = [d['path'] for d in found[1]['children']]
@@ -1238,6 +1285,7 @@ class PoolService(CRUDService):
                 wipe_job = await self.middleware.call('disk.wipe', disk, 'QUICK')
                 wipe_jobs.append((disk, wipe_job))
 
+        job.set_progress(70, 'Wiping disks')
         error_str = ''
         for index, item in enumerate(wipe_jobs):
             disk, wipe_job = item
@@ -1247,6 +1295,8 @@ class PoolService(CRUDService):
 
         if error_str:
             raise CallError(f'Failed to wipe disks:\n{error_str}')
+
+        job.set_progress(100, 'Successfully completed wiping disks')
 
     @private
     def configure_resilver_priority(self):
@@ -1304,6 +1354,17 @@ class PoolService(CRUDService):
             sysctl.filter('vfs.zfs.vdev.scrub_max_active')[0].value = scrub_max_active
 
     @accepts()
+    @returns(List(
+        'pools_available_for_import',
+        title='Pools Available For Import',
+        items=[Dict(
+            'pool_info',
+            Str('name', required=True),
+            Str('guid', required=True),
+            Str('status', required=True),
+            Str('hostname', required=True),
+        )]
+    ))
     @job()
     async def import_find(self, job):
         """
@@ -1336,6 +1397,7 @@ class PoolService(CRUDService):
         Str('passphrase', private=True),
         Bool('enable_attachments'),
     ))
+    @returns(Bool('successful_import'))
     @job(lock='import_pool', pipes=['input'], check_pipes=False)
     async def import_pool(self, job, data):
         """
@@ -1393,11 +1455,6 @@ class PoolService(CRUDService):
         else:
             encrypt = 0
 
-        activated_jail_pool = None
-        if osc.IS_FREEBSD:
-            with contextlib.suppress(Exception):
-                activated_jail_pool = await self.middleware.call('jail.get_activated_pool')
-
         pool_name = data.get('name') or pool['name']
         pool_id = None
         try:
@@ -1447,16 +1504,6 @@ class PoolService(CRUDService):
                 os.unlink(passfile)
             raise
 
-        if activated_jail_pool:
-            # It is possible the imported pool had iocage set up. System will give preference to
-            # the already configured pool in this case, user can always change this later
-            try:
-                await self.middleware.call('jail.activate', activated_jail_pool)
-            except CallError as e:
-                self.middleware.logger.debug(
-                    f'Failed to activate {activated_jail_pool} after importing {pool_name} pool: {e}'
-                )
-
         key = f'pool:{pool["name"]}:enable_on_import'
         if await self.middleware.call('keyvalue.has_key', key):
             for name, ids in (await self.middleware.call('keyvalue.get', key)).items():
@@ -1491,6 +1538,7 @@ class PoolService(CRUDService):
             Bool('destroy', default=False),
         ),
     )
+    @returns()
     @job(lock='pool_export')
     async def export(self, job, oid, options):
         """
@@ -1567,7 +1615,7 @@ class PoolService(CRUDService):
         await self.middleware.call('iscsi.global.terminate_luns_for_pool', pool['name'])
 
         job.set_progress(30, 'Removing pool disks from swap')
-        disks = [i async for i in await self.middleware.call('pool.get_disks', oid)]
+        disks = await self.middleware.call('pool.get_disks', oid)
 
         # We don't want to configure swap immediately after removing those disks because we might get in a race
         # condition where swap starts using the pool disks as the pool might not have been exported/destroyed yet
@@ -1648,6 +1696,12 @@ class PoolService(CRUDService):
 
     @item_method
     @accepts(Int('id'))
+    @returns(List(items=[Dict(
+        'attachment',
+        Str('type', required=True),
+        Str('service', required=True, null=True),
+        List('attachments', items=[Str('attachment_name')]),
+    )], register=True))
     async def attachments(self, oid):
         """
         Return a list of services dependent of this pool.
@@ -1660,6 +1714,13 @@ class PoolService(CRUDService):
 
     @item_method
     @accepts(Int('id'))
+    @returns(List(items=[Dict(
+        'process',
+        Int('pid', required=True),
+        Str('name', required=True),
+        Str('service'),
+        Str('cmdline', max_length=None),
+    )], register=True))
     async def processes(self, oid):
         """
         Returns a list of running processes using this pool.
@@ -1814,6 +1875,7 @@ class PoolService(CRUDService):
 
         self.middleware.call_sync('etc.generate_checkpoint', 'pool_import')
 
+        self.middleware.call_sync('zettarepl.load_removal_dates')
         self.middleware.call_sync('zettarepl.update_tasks')
 
         # Configure swaps after importing pools. devd events are not yet ready at this
@@ -1836,6 +1898,12 @@ class PoolDatasetUserPropService(CRUDService):
         datastore_primary_key_type = 'string'
         namespace = 'pool.dataset.userprop'
         cli_namespace = 'storage.dataset.user_prop'
+
+    ENTRY = Dict(
+        'pool_dataset_userprop_entry',
+        Str('id', required=True),
+        Dict('properties', additional_attrs=True, required=True),
+    )
 
     @filterable
     def query(self, filters, options):
@@ -1946,10 +2014,73 @@ class PoolDatasetEncryptionModel(sa.Model):
     kmip_uid = sa.Column(sa.String(255), nullable=True, default=None)
 
 
+def get_props_of_interest_mapping():
+    return [
+        ('org.freenas:description', 'comments', None),
+        ('org.freenas:quota_warning', 'quota_warning', None),
+        ('org.freenas:quota_critical', 'quota_critical', None),
+        ('org.freenas:refquota_warning', 'refquota_warning', None),
+        ('org.freenas:refquota_critical', 'refquota_critical', None),
+        ('org.truenas:managedby', 'managedby', None),
+        ('dedup', 'deduplication', str.upper),
+        ('mountpoint', None, _null),
+        ('aclmode', None, str.upper),
+        ('acltype', None, str.upper),
+        ('xattr', None, str.upper),
+        ('atime', None, str.upper),
+        ('casesensitivity', None, str.upper),
+        ('checksum', None, str.upper),
+        ('exec', None, str.upper),
+        ('sync', None, str.upper),
+        ('compression', None, str.upper),
+        ('compressratio', None, None),
+        ('origin', None, None),
+        ('quota', None, _null),
+        ('refquota', None, _null),
+        ('reservation', None, _null),
+        ('refreservation', None, _null),
+        ('copies', None, None),
+        ('snapdir', None, str.upper),
+        ('readonly', None, str.upper),
+        ('recordsize', None, None),
+        ('sparse', None, None),
+        ('volsize', None, None),
+        ('volblocksize', None, None),
+        ('keyformat', 'key_format', lambda o: o.upper() if o != 'none' else None),
+        ('encryption', 'encryption_algorithm', lambda o: o.upper() if o != 'off' else None),
+        ('used', None, None),
+        ('available', None, None),
+        ('special_small_blocks', 'special_small_block_size', None),
+        ('pbkdf2iters', None, None),
+        ('creation', None, None),
+    ]
+
+
 class PoolDatasetService(CRUDService):
 
     attachment_delegates = []
     dataset_store = 'storage.encrypteddataset'
+    ENTRY = Dict(
+        'pool_dataset_entry',
+        Str('id', required=True),
+        Str('type', required=True),
+        Str('name', required=True),
+        Str('pool', required=True),
+        Bool('encrypted'),
+        Str('encryption_root', null=True),
+        Bool('key_loaded', null=True),
+        List('children', required=True),
+        Dict('user_properties', additional_attrs=True, required=True),
+        Bool('locked'),
+        *[Dict(
+            p[1] or p[0],
+            Any('parsed', null=True),
+            Str('rawvalue', null=True),
+            Str('value', null=True),
+            Str('source', null=True),
+        ) for p in get_props_of_interest_mapping() if (p[1] or p[0]) != 'mountpoint'],
+        Str('mountpoint', null=True),
+    )
 
     class Config:
         datastore_primary_key_type = 'string'
@@ -1958,6 +2089,19 @@ class PoolDatasetService(CRUDService):
         cli_namespace = 'storage.dataset'
 
     @accepts()
+    @returns(Dict(
+        *[Str(k, enum=[k]) for k in ZFS_CHECKSUM_CHOICES if k != 'OFF'],
+    ))
+    async def checksum_choices(self):
+        """
+        Retrieve checksums supported for ZFS dataset.
+        """
+        return {v: v for v in ZFS_CHECKSUM_CHOICES if v != 'OFF'}
+
+    @accepts()
+    @returns(Dict(
+        *[Str(k, enum=[k]) for k in ZFS_COMPRESSION_ALGORITHM_CHOICES],
+    ))
     async def compression_choices(self):
         """
         Retrieve compression algorithm supported by ZFS.
@@ -1965,6 +2109,9 @@ class PoolDatasetService(CRUDService):
         return {v: v for v in ZFS_COMPRESSION_ALGORITHM_CHOICES}
 
     @accepts()
+    @returns(Dict(
+        *[Str(k, enum=[k]) for k in ZFS_ENCRYPTION_ALGORITHM_CHOICES],
+    ))
     async def encryption_algorithm_choices(self):
         """
         Retrieve encryption algorithms supported for ZFS dataset encryption.
@@ -2159,6 +2306,7 @@ class PoolDatasetService(CRUDService):
             await self.middleware.call('datastore.delete', self.dataset_store, ds['id'])
 
     @accepts(Str('id'))
+    @returns()
     @job(lock='dataset_export_keys', pipes=['output'])
     def export_keys(self, job, id):
         """
@@ -2189,6 +2337,7 @@ class PoolDatasetService(CRUDService):
         Str('id'),
         Bool('download', default=False),
     )
+    @returns(Str('key', null=True))
     @job(lock='dataset_export_keys', pipes=['output'], check_pipes=False)
     def export_key(self, job, id, download):
         """
@@ -2220,6 +2369,7 @@ class PoolDatasetService(CRUDService):
             Bool('force_umount', default=False),
         )
     )
+    @returns(Bool('locked'))
     @job(lock=lambda args: 'dataset_lock')
     async def lock(self, job, id, options):
         """
@@ -2279,6 +2429,15 @@ class PoolDatasetService(CRUDService):
             ),
         )
     )
+    @returns(Dict(
+        List('unlocked', items=[Str('dataset')], required=True),
+        Dict(
+            'failed',
+            required=True,
+            additional_attrs=True,
+            example={'vol1/enc': {'error': 'Invalid Key', 'skipped': []}},
+        ),
+    ))
     @job(lock=lambda args: f'dataset_unlock_{args[0]}', pipes=['input'], check_pipes=False)
     def unlock(self, job, id, options):
         """
@@ -2451,6 +2610,16 @@ class PoolDatasetService(CRUDService):
             ),
         )
     )
+    @returns(List(items=[Dict(
+        'dataset_encryption_summary',
+        Str('name', required=True),
+        Str('key_format', required=True),
+        Bool('key_present_in_database', required=True),
+        Bool('valid_key', required=True),
+        Bool('locked', required=True),
+        Str('unlock_error', required=True, null=True),
+        Bool('unlock_successful', required=True),
+    )]))
     @job(lock=lambda args: f'encryption_summary_options_{args[0]}', pipes=['input'], check_pipes=False)
     def encryption_summary(self, job, id, options):
         """
@@ -2590,6 +2759,7 @@ class PoolDatasetService(CRUDService):
             Str('key', validators=[Range(min=64, max=64)], default=None, null=True, private=True),
         )
     )
+    @returns()
     @job(lock=lambda args: f'dataset_change_key_{args[0]}', pipes=['input'], check_pipes=False)
     async def change_key(self, job, id, options):
         """
@@ -2686,6 +2856,7 @@ class PoolDatasetService(CRUDService):
         await self.middleware.call_hook('dataset.change_key', data)
 
     @accepts(Str('id'))
+    @returns()
     async def inherit_parent_encryption_properties(self, id):
         """
         Allows inheriting parent's encryption root discarding its current encryption settings. This
@@ -2794,6 +2965,16 @@ class PoolDatasetService(CRUDService):
         `query-options.extra.properties` which when `null` ( which is the default ) will retrieve all properties
         and otherwise a list can be specified like `["type", "used", "available"]` to retrieve selective properties.
         If no properties are desired, in that case an empty list should be sent.
+
+        `query-options.extra.snapshots` can be set to retrieve snapshot(s) of dataset in question.
+
+        `query-options.extra.snapshots_recursive` can be set to retrieve snapshot(s) recursively of dataset in question.
+        If `query-options.extra.snapshots_recursive` and `query-options.extra.snapshots` are set, snapshot(s) will be
+        retrieved recursively.
+
+        `query-options.extra.snapshots_properties` can be specified to list out properties which should be retrieved
+        for snapshot(s) related to each dataset. By default only name of the snapshot would be retrieved, however
+        if `null` is specified all properties of the snapshot would be retrieved in this case.
         """
         # Optimization for cases in which they can be filtered at zfs.dataset.query
         zfsfilters = []
@@ -2806,16 +2987,33 @@ class PoolDatasetService(CRUDService):
         extra = copy.deepcopy(options.get('extra', {}))
         retrieve_children = extra.get('retrieve_children', True)
         props = extra.get('properties')
+        snapshots = extra.get('snapshots')
+        snapshots_recursive = extra.get('snapshots_recursive')
         return filter_list(
             self.__transform(self.middleware.call_sync(
                 'zfs.dataset.query', zfsfilters, {
                     'extra': {
-                        'flat': extra.get('flat', True), 'retrieve_children': retrieve_children, 'properties': props,
+                        'flat': extra.get('flat', True),
+                        'retrieve_children': retrieve_children,
+                        'properties': props,
+                        'snapshots': snapshots,
+                        'snapshots_recursive': snapshots_recursive,
+                        'snapshots_properties': extra.get('snapshots_properties', [])
                     }
                 }
             ), retrieve_children, internal_datasets_filters,
             ), filters, options
         )
+
+    def _internal_user_props(self):
+        return [
+            'org.freenas:description',
+            'org.freenas:quota_warning',
+            'org.freenas:quota_critical',
+            'org.freenas:refquota_warning',
+            'org.freenas:refquota_critical',
+            'org.truenas:managedby',
+        ]
 
     def __transform(self, datasets, retrieve_children, children_filters):
         """
@@ -2824,48 +3022,23 @@ class PoolDatasetService(CRUDService):
         """
 
         def transform(dataset):
-            for orig_name, new_name, method in (
-                ('org.freenas:description', 'comments', None),
-                ('org.freenas:quota_warning', 'quota_warning', None),
-                ('org.freenas:quota_critical', 'quota_critical', None),
-                ('org.freenas:refquota_warning', 'refquota_warning', None),
-                ('org.freenas:refquota_critical', 'refquota_critical', None),
-                ('org.truenas:managedby', 'managedby', None),
-                ('dedup', 'deduplication', str.upper),
-                ('aclmode', None, str.upper),
-                ('acltype', None, str.upper),
-                ('xattr', None, str.upper),
-                ('atime', None, str.upper),
-                ('casesensitivity', None, str.upper),
-                ('exec', None, str.upper),
-                ('sync', None, str.upper),
-                ('compression', None, str.upper),
-                ('compressratio', None, None),
-                ('origin', None, None),
-                ('quota', None, _null),
-                ('refquota', None, _null),
-                ('reservation', None, _null),
-                ('refreservation', None, _null),
-                ('copies', None, None),
-                ('snapdir', None, str.upper),
-                ('readonly', None, str.upper),
-                ('recordsize', None, None),
-                ('sparse', None, None),
-                ('volsize', None, None),
-                ('volblocksize', None, None),
-                ('keyformat', 'key_format', lambda o: o.upper() if o != 'none' else None),
-                ('encryption', 'encryption_algorithm', lambda o: o.upper() if o != 'off' else None),
-                ('used', None, None),
-                ('available', None, None),
-                ('special_small_blocks', 'special_small_block_size', None),
-                ('pbkdf2iters', None, None),
-            ):
+            for orig_name, new_name, method in get_props_of_interest_mapping():
                 if orig_name not in dataset['properties']:
                     continue
                 i = new_name or orig_name
                 dataset[i] = dataset['properties'][orig_name]
                 if method:
                     dataset[i]['value'] = method(dataset[i]['value'])
+
+            if 'mountpoint' in dataset:
+                # This is treated specially to keep backwards compatibility with API
+                dataset['mountpoint'] = dataset['mountpoint']['value']
+            if dataset['type'] == 'VOLUME':
+                dataset['mountpoint'] = None
+
+            dataset['user_properties'] = {
+                k: v for k, v in dataset['properties'].items() if ':' in k and k not in self._internal_user_props()
+            }
             del dataset['properties']
 
             if all(k in dataset for k in ('encrypted', 'key_loaded')):
@@ -2894,38 +3067,46 @@ class PoolDatasetService(CRUDService):
         ]),
         Bool('sparse'),
         Bool('force_size'),
-        Str('comments'),
-        Str('sync', enum=[
-            'STANDARD', 'ALWAYS', 'DISABLED',
-        ]),
-        Str('compression', enum=ZFS_COMPRESSION_ALGORITHM_CHOICES),
-        Str('atime', enum=['ON', 'OFF']),
-        Str('exec', enum=['ON', 'OFF']),
-        Str('managedby', empty=False),
+        Inheritable(Str('comments')),
+        Inheritable(Str('sync', enum=['STANDARD', 'ALWAYS', 'DISABLED'])),
+        Inheritable(Str('compression', enum=ZFS_COMPRESSION_ALGORITHM_CHOICES)),
+        Inheritable(Str('atime', enum=['ON', 'OFF']), has_default=False),
+        Inheritable(Str('exec', enum=['ON', 'OFF'])),
+        Inheritable(Str('managedby', empty=False)),
         Int('quota', null=True, validators=[Or(Range(min=1024**3), Exact(0))]),
-        Int('quota_warning', validators=[Range(0, 100)]),
-        Int('quota_critical', validators=[Range(0, 100)]),
+        Inheritable(Int('quota_warning', validators=[Range(0, 100)])),
+        Inheritable(Int('quota_critical', validators=[Range(0, 100)])),
         Int('refquota', null=True, validators=[Or(Range(min=1024**3), Exact(0))]),
-        Int('refquota_warning', validators=[Range(0, 100)]),
-        Int('refquota_critical', validators=[Range(0, 100)]),
+        Inheritable(Int('refquota_warning', validators=[Range(0, 100)])),
+        Inheritable(Int('refquota_critical', validators=[Range(0, 100)])),
         Int('reservation'),
         Int('refreservation'),
-        Int('special_small_block_size'),
-        Int('copies'),
-        Str('snapdir', enum=['VISIBLE', 'HIDDEN']),
-        Str('deduplication', enum=['ON', 'VERIFY', 'OFF']),
-        Str('readonly', enum=['ON', 'OFF']),
-        Str('recordsize', enum=[
+        Inheritable(Int('special_small_block_size'), has_default=False),
+        Inheritable(Int('copies')),
+        Inheritable(Str('snapdir', enum=['VISIBLE', 'HIDDEN'])),
+        Inheritable(Str('deduplication', enum=['ON', 'VERIFY', 'OFF'])),
+        Inheritable(Str('checksum', enum=ZFS_CHECKSUM_CHOICES)),
+        Inheritable(Str('readonly', enum=['ON', 'OFF'])),
+        Inheritable(Str('recordsize', enum=[
             '512', '1K', '2K', '4K', '8K', '16K', '32K', '64K', '128K', '256K', '512K', '1024K',
-        ]),
-        Str('casesensitivity', enum=['SENSITIVE', 'INSENSITIVE', 'MIXED']),
-        Str('aclmode', enum=['PASSTHROUGH', 'RESTRICTED', 'DISCARD']),
-        Str('acltype', enum=['OFF', 'NOACL', 'NFSV4', 'NFS4ACL', 'POSIX', 'POSIXACL']),
+        ]), has_default=False),
+        Inheritable(Str('casesensitivity', enum=['SENSITIVE', 'INSENSITIVE', 'MIXED']), has_default=False),
+        Inheritable(Str('aclmode', enum=['PASSTHROUGH', 'RESTRICTED', 'DISCARD']), has_default=False),
+        Inheritable(Str('acltype', enum=['OFF', 'NOACL', 'NFSV4', 'NFS4ACL', 'POSIX', 'POSIXACL']), has_default=False),
         Str('share_type', default='GENERIC', enum=['GENERIC', 'SMB']),
-        Str('xattr', enum=['ON', 'SA']),
+        Inheritable(Str('xattr', enum=['ON', 'SA'])),
         Ref('encryption_options'),
         Bool('encryption', default=False),
         Bool('inherit_encryption', default=True),
+        List(
+            'user_properties',
+            items=[Dict(
+                'user_property',
+                Str('key', required=True, validators=[Match(r'.*:.*')]),
+                Str('value', requried=True),
+            )],
+        ),
+        Bool('create_ancestors', default=False),
         register=True,
     ))
     @pass_app(rest=True)
@@ -2973,7 +3154,25 @@ class PoolDatasetService(CRUDService):
         if '/' not in data['name']:
             verrors.add('pool_dataset_create.name', 'You need a full name, e.g. pool/newdataset')
         else:
-            parent_ds = await self.middleware.call('pool.dataset.query', [('id', '=', data['name'].rsplit('/', 1)[0])], {'extra': {'retrieve_children': False}})
+            parent_name = data['name'].rsplit('/', 1)[0]
+            if data['create_ancestors']:
+                # If we want to create ancestors, let's just ensure that we have at least one parent which exists
+                while not await self.middleware.call(
+                    'pool.dataset.query',
+                    [['id', '=', parent_name]], {
+                        'extra': {'retrieve_children': False, 'properties': []}
+                    }
+                ):
+                    if '/' not in parent_name:
+                        # Root dataset / pool does not exist
+                        break
+                    parent_name = parent_name.rsplit('/', 1)[0]
+
+            parent_ds = await self.middleware.call(
+                'pool.dataset.query',
+                [('id', '=', parent_name)],
+                {'extra': {'retrieve_children': False}}
+            )
             await self.__common_validation(verrors, 'pool_dataset_create', data, 'CREATE', parent_ds)
 
         verrors.check()
@@ -2983,17 +3182,10 @@ class PoolDatasetService(CRUDService):
         if os.path.exists(mountpoint):
             verrors.add('pool_dataset_create.name', f'Path {mountpoint} already exists')
 
-        if osc.IS_LINUX and data['type'] == 'FILESYSTEM':
-            if not data.get('acltype'):
-                data['acltype'] = 'POSIX'
-                data['aclmode'] = 'DISCARD'
-            if not data.get('xattr'):
-                data['xattr'] = 'SA'
-
         if data['share_type'] == 'SMB':
             data['casesensitivity'] = 'INSENSITIVE'
-            if osc.IS_FREEBSD:
-                data['aclmode'] = 'RESTRICTED'
+            data['acltype'] = 'NFSV4'
+            data['aclmode'] = 'RESTRICTED'
 
         if parent_ds['locked']:
             verrors.add(
@@ -3049,49 +3241,54 @@ class PoolDatasetService(CRUDService):
             if uri and uri not in [
                 '::1', '127.0.0.1', *[d['address'] for d in await self.middleware.call('interface.ip_in_use')]
             ]:
-                data['managedby'] = uri if not data.get('managedby') else f'{data["managedby"]}@{uri}'
+                data['managedby'] = uri if not data['managedby'] != 'INHERIT' else f'{data["managedby"]}@{uri}'
 
         props = {}
-        for i, real_name, transform in (
-            ('aclmode', None, str.lower),
-            ('acltype', None, str.lower),
-            ('atime', None, str.lower),
-            ('casesensitivity', None, str.lower),
-            ('comments', 'org.freenas:description', None),
-            ('compression', None, str.lower),
-            ('copies', None, lambda x: str(x)),
-            ('deduplication', 'dedup', str.lower),
-            ('exec', None, str.lower),
-            ('managedby', 'org.truenas:managedby', None),
-            ('quota', None, _none),
-            ('quota_warning', 'org.freenas:quota_warning', str),
-            ('quota_critical', 'org.freenas:quota_critical', str),
-            ('readonly', None, str.lower),
-            ('recordsize', None, None),
-            ('refquota', None, _none),
-            ('refquota_warning', 'org.freenas:refquota_warning', str),
-            ('refquota_critical', 'org.freenas:refquota_critical', str),
-            ('refreservation', None, _none),
-            ('reservation', None, _none),
-            ('snapdir', None, str.lower),
-            ('sparse', None, None),
-            ('sync', None, str.lower),
-            ('volblocksize', None, None),
-            ('volsize', None, lambda x: str(x)),
-            ('xattr', None, str.lower),
-            ('special_small_block_size', 'special_small_blocks', None),
+        for i, real_name, transform, inheritable in (
+            ('aclmode', None, str.lower, True),
+            ('acltype', None, str.lower, True),
+            ('atime', None, str.lower, True),
+            ('casesensitivity', None, str.lower, True),
+            ('checksum', None, str.lower, True),
+            ('comments', 'org.freenas:description', None, True),
+            ('compression', None, str.lower, True),
+            ('copies', None, lambda x: str(x), True),
+            ('deduplication', 'dedup', str.lower, True),
+            ('exec', None, str.lower, True),
+            ('managedby', 'org.truenas:managedby', None, True),
+            ('quota', None, _none, True),
+            ('quota_warning', 'org.freenas:quota_warning', str, True),
+            ('quota_critical', 'org.freenas:quota_critical', str, True),
+            ('readonly', None, str.lower, True),
+            ('recordsize', None, None, True),
+            ('refquota', None, _none, True),
+            ('refquota_warning', 'org.freenas:refquota_warning', str, True),
+            ('refquota_critical', 'org.freenas:refquota_critical', str, True),
+            ('refreservation', None, _none, False),
+            ('reservation', None, _none, False),
+            ('snapdir', None, str.lower, True),
+            ('sparse', None, None, False),
+            ('sync', None, str.lower, True),
+            ('volblocksize', None, None, False),
+            ('volsize', None, lambda x: str(x), False),
+            ('xattr', None, str.lower, True),
+            ('special_small_block_size', 'special_small_blocks', None, True),
         ):
-            if i not in data:
+            if i not in data or (inheritable and data[i] == 'INHERIT'):
                 continue
             name = real_name or i
             props[name] = data[i] if not transform else transform(data[i])
 
-        props.update(encryption_dict)
+        props.update(
+            **encryption_dict,
+            **(await self.get_create_update_user_props(data['user_properties']))
+        )
 
         await self.middleware.call('zfs.dataset.create', {
             'name': data['name'],
             'type': data['type'],
             'properties': props,
+            'create_ancestors': data['create_ancestors'],
         })
 
         dataset_data = {
@@ -3105,15 +3302,22 @@ class PoolDatasetService(CRUDService):
 
         await self.middleware.call('zfs.dataset.mount', data['name'])
 
-        if data['type'] == 'FILESYSTEM' and data['share_type'] == 'SMB' and data['acltype'] == "NFS4":
+        created_ds = await self.get_instance(data['id'])
+
+        if data['type'] == 'FILESYSTEM' and data['share_type'] == 'SMB' and created_ds['acltype']['value'] == "NFSV4":
             await self.middleware.call('pool.dataset.permission', data['id'], {'mode': None})
 
-        return await self.get_instance(data['id'])
+        return created_ds
 
-    def _add_inherit(name):
-        def add(attr):
-            attr.enum.append('INHERIT')
-        return {'name': name, 'method': add}
+    @private
+    async def get_create_update_user_props(self, user_properties, update=False):
+        props = {}
+        for prop in user_properties:
+            if 'value' in prop:
+                props[prop['key']] = {'value': prop['value']} if update else prop['value']
+            elif prop.get('remove'):
+                props[prop['key']] = {'source': 'INHERIT'}
+        return props
 
     @accepts(Str('id', required=True), Patch(
         'pool_dataset_create', 'pool_dataset_update',
@@ -3126,18 +3330,15 @@ class PoolDatasetService(CRUDService):
         ('rm', {'name': 'encryption'}),  # Create time only attribute
         ('rm', {'name': 'encryption_options'}),  # Create time only attribute
         ('rm', {'name': 'inherit_encryption'}),  # Create time only attribute
-        ('edit', _add_inherit('atime')),
-        ('edit', _add_inherit('exec')),
-        ('edit', _add_inherit('sync')),
-        ('edit', _add_inherit('compression')),
-        ('edit', _add_inherit('deduplication')),
-        ('edit', _add_inherit('readonly')),
-        ('edit', _add_inherit('recordsize')),
-        ('edit', _add_inherit('snapdir')),
-        ('add', Inheritable('quota_warning', value=Int('quota_warning', validators=[Range(0, 100)]))),
-        ('add', Inheritable('quota_critical', value=Int('quota_critical', validators=[Range(0, 100)]))),
-        ('add', Inheritable('refquota_warning', value=Int('refquota_warning', validators=[Range(0, 100)]))),
-        ('add', Inheritable('refquota_critical', value=Int('refquota_critical', validators=[Range(0, 100)]))),
+        ('add', List(
+            'user_properties_update',
+            items=[Dict(
+                'user_property',
+                Str('key', required=True, validators=[Match(r'.*:.*')]),
+                Str('value'),
+                Bool('remove'),
+            )],
+        )),
         ('attr', {'update': True}),
     ))
     async def do_update(self, id, data):
@@ -3158,10 +3359,11 @@ class PoolDatasetService(CRUDService):
                 }]
             }
         """
-
         verrors = ValidationErrors()
 
-        dataset = await self.middleware.call('pool.dataset.query', [('id', '=', id)])
+        dataset = await self.middleware.call(
+            'pool.dataset.query', [('id', '=', id)], {'extra': {'retrieve_children': False}}
+        )
         if not dataset:
             verrors.add('id', f'{id} does not exist', errno.ENOENT)
         else:
@@ -3169,7 +3371,7 @@ class PoolDatasetService(CRUDService):
             data['name'] = dataset[0]['name']
             if data['type'] == 'VOLUME':
                 data['volblocksize'] = dataset[0]['volblocksize']['value']
-            await self.__common_validation(verrors, 'pool_dataset_update', data, 'UPDATE')
+            await self.__common_validation(verrors, 'pool_dataset_update', data, 'UPDATE', cur_dataset=dataset[0])
             if 'volsize' in data:
                 if data['volsize'] < dataset[0]['volsize']['parsed']:
                     verrors.add('pool_dataset_update.volsize',
@@ -3179,7 +3381,9 @@ class PoolDatasetService(CRUDService):
 
         properties_definitions = (
             ('aclmode', None, str.lower, True),
+            ('acltype', None, str.lower, True),
             ('atime', None, str.lower, True),
+            ('checksum', None, str.lower, True),
             ('comments', 'org.freenas:description', None, False),
             ('sync', None, str.lower, True),
             ('compression', None, str.lower, True),
@@ -3194,7 +3398,7 @@ class PoolDatasetService(CRUDService):
             ('refquota_critical', 'org.freenas:refquota_critical', str, True),
             ('reservation', None, _none, False),
             ('refreservation', None, _none, False),
-            ('copies', None, None, False),
+            ('copies', None, None, True),
             ('snapdir', None, str.lower, True),
             ('readonly', None, str.lower, True),
             ('recordsize', None, None, True),
@@ -3212,6 +3416,9 @@ class PoolDatasetService(CRUDService):
             else:
                 props[name] = {'value': data[i] if not transform else transform(data[i])}
 
+        if data.get('user_properties_update'):
+            props.update(await self.get_create_update_user_props(data['user_properties_update'], True))
+
         try:
             await self.middleware.call('zfs.dataset.update', id, {'properties': props})
         except ZFSSetPropertyError as e:
@@ -3225,7 +3432,7 @@ class PoolDatasetService(CRUDService):
 
         return await self.get_instance(id)
 
-    async def __common_validation(self, verrors, schema, data, mode, parent=None):
+    async def __common_validation(self, verrors, schema, data, mode, parent=None, cur_dataset=None):
         assert mode in ('CREATE', 'UPDATE')
 
         if parent is None:
@@ -3242,41 +3449,44 @@ class PoolDatasetService(CRUDService):
             )
 
         if not parent:
-            verrors.add(
-                f'{schema}.name',
-                'Please specify a pool which exists for the dataset/volume to be created'
-            )
+            # This will only be true on dataset creation
+            if data['create_ancestors']:
+                verrors.add(
+                    f'{schema}.name',
+                    'Please specify a pool which exists for the dataset/volume to be created'
+                )
+            else:
+                verrors.add(f'{schema}.name', 'Parent dataset does not exist for specified name')
         else:
             parent = parent[0]
 
-        if data['type'] == 'FILESYSTEM':
-            if data.get('acltype') or data.get('aclmode'):
-                to_check = data.copy()
-                if mode == "UPDATE":
-                    ds = await self.get_instance(data['name'])
-                    if not data.get('aclmode'):
-                        to_check['aclmode'] = ds['aclmode']['value']
+        # We raise validation errors here as parent could be used down to validate other aspects of the dataset
+        verrors.check()
 
-                    if not data.get('acltype'):
-                        to_check['acltype'] = ds['acltype']['value']
+        if data['type'] == 'FILESYSTEM':
+            if data.get('acltype', 'INHERIT') != 'INHERIT' or data.get('aclmode', 'INHERIT') != 'INHERIT':
+                to_check = data.copy()
+                check_ds = cur_dataset if mode == 'UPDATE' else parent
+                if data.get('aclmode', 'INHERIT') == 'INHERIT':
+                    to_check['aclmode'] = check_ds['aclmode']['value']
+
+                if data.get('acltype', 'INHERIT') == 'INHERIT':
+                    to_check['acltype'] = check_ds['acltype']['value']
 
                 if to_check.get('acltype', 'POSIX') in ['POSIX', 'OFF'] and to_check.get('aclmode', 'DISCARD') != 'DISCARD':
                     verrors.add(f'{schema}.aclmode', 'Must be set to DISCARD when acltype is POSIX or OFF')
-
-            if data.get("acltype") and osc.IS_FREEBSD:
-                verrors.add(f'{schema}.acltype', 'This field is not valid for TrueNAS')
 
             for i in ('force_size', 'sparse', 'volsize', 'volblocksize'):
                 if i in data:
                     verrors.add(f'{schema}.{i}', 'This field is not valid for FILESYSTEM')
 
             c_value = data.get('special_small_block_size')
-            if 'special_small_block_size' in data and not (
+            if 'special_small_block_size' in data and c_value != 'INHERIT' and not (
                 c_value == 0 or 512 <= data['special_small_block_size'] <= 1048576 or c_value % 512 == 0
             ):
                 verrors.add(
                     f'{schema}.special_small_block_size',
-                    'This field can be 0 or multiple of 512, up to 1048576'
+                    'This field can be "INHERIT", 0 or multiple of 512, up to 1048576'
                 )
         elif data['type'] == 'VOLUME':
             if mode == 'CREATE' and 'volsize' not in data:
@@ -3316,6 +3526,29 @@ class PoolDatasetService(CRUDService):
                             f'{schema}.volsize',
                             'Volume size should be a multiple of volume block size'
                         )
+
+        if mode == 'UPDATE':
+            if data.get('user_properties_update') and not data.get('user_properties'):
+                for index, prop in enumerate(data['user_properties_update']):
+                    prop_schema = f'{schema}.user_properties_update.{index}'
+                    if 'value' in prop and prop.get('remove'):
+                        verrors.add(f'{prop_schema}.remove', 'When "value" is specified, this cannot be set')
+                    elif not any(k in prop for k in ('value', 'remove')):
+                        verrors.add(f'{prop_schema}.value', 'Either "value" or "remove" must be specified')
+            elif data.get('user_properties') and data.get('user_properties_update'):
+                verrors.add(
+                    f'{schema}.user_properties_update',
+                    'Should not be specified when "user_properties" are explicitly specified'
+                )
+            elif data.get('user_properties'):
+                # Let's normalize this so that we create/update/remove user props accordingly
+                user_props = {p['key'] for p in data['user_properties']}
+                data['user_properties_update'] = data['user_properties']
+                for prop_key in [k for k in cur_dataset['user_properties'] if k not in user_props]:
+                    data['user_properties_update'].append({
+                        'key': prop_key,
+                        'remove': True,
+                    })
 
     def __handle_zfs_set_property_error(self, e, properties_definitions):
         zfs_name_to_api_name = {i[1]: i[0] for i in properties_definitions}
@@ -3369,6 +3602,7 @@ class PoolDatasetService(CRUDService):
 
     @item_method
     @accepts(Str('id'))
+    @returns()
     async def promote(self, id):
         """
         Promote the cloned dataset `id`.
@@ -3482,10 +3716,11 @@ class PoolDatasetService(CRUDService):
                 Bool('stripacl', default=False),
                 Bool('recursive', default=False),
                 Bool('traverse', default=False),
-            )
-
+            ),
+            register=True,
         ),
     )
+    @returns(Ref('pool_dataset_permission'))
     @item_method
     @job(lock="dataset_permission_change")
     async def permission(self, job, id, data):
@@ -3605,6 +3840,7 @@ class PoolDatasetService(CRUDService):
             raise CallError(pjob.error)
         return data
 
+    # TODO: Document this please
     @accepts(
         Str('ds', required=True),
         Str('quota_type', enum=['USER', 'GROUP', 'DATASET']),
@@ -3663,6 +3899,7 @@ class PoolDatasetService(CRUDService):
             'quota_value': 0
         }])
     )
+    @returns()
     @item_method
     async def set_quota(self, ds, data):
         """
@@ -3785,6 +4022,7 @@ class PoolDatasetService(CRUDService):
             await self.middleware.call('zfs.dataset.set_quota', dataset, quota_list)
 
     @accepts(Str('pool'))
+    @returns(Str())
     async def recommended_zvol_blocksize(self, pool):
         """
         Helper method to get recommended size for a new zvol (dataset of type VOLUME).
@@ -3803,26 +4041,41 @@ class PoolDatasetService(CRUDService):
         """
         pool = await self.middleware.call('pool.query', [['name', '=', pool]])
         if not pool:
-            raise CallError('Pool not found.', errno.ENOENT)
-        pool = pool[0]
-        numdisks = 4
-        for vdev in pool['topology']['data']:
+            raise CallError(f'"{pool}" not found.', errno.ENOENT)
+
+        """
+        Cheatsheat for blocksizes is as follows:
+        2w/3w mirror = 16K
+        3wZ1, 4wZ2, 5wZ3 = 16K
+        4w/5wZ1, 5w/6wZ2, 6w/7wZ3 = 32K
+        6w/7w/8w/9wZ1, 7w/8w/9w/10wZ2, 8w/9w/10w/11wZ3 = 64K
+        10w+Z1, 11w+Z2, 12w+Z3 = 128K
+
+        If the zpool was forcefully created with mismatched
+        vdev geometry (i.e. 3wZ1 and a 5wZ1) then we calculate
+        the blocksize based on the largest vdev of the zpool.
+        """
+        maxdisks = 1
+        for vdev in pool[0]['topology']['data']:
             if vdev['type'] == 'RAIDZ1':
-                num = len(vdev['children']) - 1
+                disks = len(vdev['children']) - 1
             elif vdev['type'] == 'RAIDZ2':
-                num = len(vdev['children']) - 2
+                disks = len(vdev['children']) - 2
             elif vdev['type'] == 'RAIDZ3':
-                num = len(vdev['children']) - 3
+                disks = len(vdev['children']) - 3
             elif vdev['type'] == 'MIRROR':
-                num = 1
+                disks = maxdisks
             else:
-                num = len(vdev['children'])
-            if num > numdisks:
-                numdisks = num
-        return '%dK' % 2 ** ((numdisks * 4) - 1).bit_length()
+                disks = len(vdev['children'])
+
+            if disks > maxdisks:
+                maxdisks = disks
+
+        return f'{max(16, min(128, 2 ** ((maxdisks * 8) - 1).bit_length()))}K'
 
     @item_method
     @accepts(Str('id', required=True))
+    @returns(Ref('attachments'))
     async def attachments(self, oid):
         """
         Return a list of services dependent of this dataset.
@@ -3859,6 +4112,7 @@ class PoolDatasetService(CRUDService):
 
     @item_method
     @accepts(Str('id', required=True))
+    @returns(Ref('processes'))
     async def processes(self, oid):
         """
         Return a list of processes using this dataset.
@@ -3971,7 +4225,10 @@ class PoolDatasetService(CRUDService):
                 else:
                     self.logger.info('Killing process %r (%r) that holds dataset %r', process['pid'],
                                      process['cmdline'], oid)
-                    await self.middleware.call('service.terminate_process', process['pid'])
+                    try:
+                        await self.middleware.call('service.terminate_process', process['pid'])
+                    except CallError as e:
+                        self.logger.warning('Error killing process: %r', e)
 
         processes = await self.middleware.call('pool.dataset.processes', oid)
         if not processes:
@@ -4011,6 +4268,26 @@ class PoolScrubService(CRUDService):
         datastore_prefix = 'scrub_'
         namespace = 'pool.scrub'
         cli_namespace = 'storage.scrub'
+
+    ENTRY = Dict(
+        'pool_scrub_entry',
+        Int('pool', validators=[Range(min=1)], required=True),
+        Int('threshold', validators=[Range(min=0)], required=True),
+        Str('description', required=True),
+        Cron(
+            'schedule',
+            defaults={
+                'minute': '00',
+                'hour': '00',
+                'dow': '7'
+            },
+            required=True,
+        ),
+        Bool('enabled', default=True, required=True),
+        Int('id', required=True),
+        Str('pool_name', required=True),
+        register=True
+    )
 
     @private
     async def pool_scrub_extend(self, data):
@@ -4055,21 +4332,13 @@ class PoolScrubService(CRUDService):
         return verrors, data
 
     @accepts(
-        Dict(
-            'pool_scrub_create',
-            Int('pool', validators=[Range(min=1)], required=True),
-            Int('threshold', validators=[Range(min=0)]),
-            Str('description'),
-            Cron(
-                'schedule',
-                defaults={
-                    'minute': '00',
-                    'hour': '00',
-                    'dow': '7'
-                }
-            ),
-            Bool('enabled', default=True),
-            register=True
+        Patch(
+            'pool_scrub_entry', 'pool_scrub_entry',
+            ('rm', {'name': 'id'}),
+            ('rm', {'name': 'pool_name'}),
+            ('edit', {'name': 'threshold', 'method': lambda x: setattr(x, 'required', False)}),
+            ('edit', {'name': 'schedule', 'method': lambda x: setattr(x, 'required', False)}),
+            ('edit', {'name': 'description', 'method': lambda x: setattr(x, 'required', False)}),
         )
     )
     async def do_create(self, data):
@@ -4116,12 +4385,8 @@ class PoolScrubService(CRUDService):
 
         await self.middleware.call('service.restart', 'cron')
 
-        return await self.query(filters=[('id', '=', data['id'])], options={'get': True})
+        return await self.get_instance(data['id'])
 
-    @accepts(
-        Int('id', validators=[Range(min=1)]),
-        Patch('pool_scrub_create', 'pool_scrub_update', ('attr', {'update': True}))
-    )
     async def do_update(self, id, data):
         """
         Update scrub task of `id`.
@@ -4171,6 +4436,7 @@ class PoolScrubService(CRUDService):
         return response
 
     @accepts(Str('name'), Int('threshold', default=35))
+    @returns()
     async def run(self, name, threshold):
         """
         Initiate a scrub of a pool `name` if last scrub was performed more than `threshold` days before.
