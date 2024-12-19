@@ -16,6 +16,7 @@ from .core import *  # noqa
 from .disk import *  # noqa
 from .docker import *  # noqa
 from .docker_network import *  # noqa
+from .enclosure_label import *  # noqa
 from .failover_reboot import *  # noqa
 from .fc_host import *  # noqa
 from .fcport import *  # noqa
@@ -51,5 +52,6 @@ from .vendor import *  # noqa
 from .virt_device import *  # noqa
 from .virt_global import *  # noqa
 from .virt_instance import *  # noqa
+from .virt_volume import *  # noqa
 from .vm import *  # noqa
 from .vm_device import *  # noqa
