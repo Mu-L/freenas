@@ -13,6 +13,7 @@ from .auth_two_factor import *  # noqa
 from .boot import *  # noqa
 from .boot_environments import *  # noqa
 from .catalog import *  # noqa
+from .certificate import *  # noqa
 from .cloud_backup import *  # noqa
 from .cloud_credential import *  # noqa
 from .cloud_sync import *  # noqa
@@ -54,17 +55,21 @@ from .keychain import *  # noqa
 from .kmip import *  # noqa
 from .k8s_to_docker import *  # noqa
 from .mail import *  # noqa
+from .network_configuration import *  # noqa
 from .nfs import *  # noqa
 from .pool import *  # noqa
 from .pool_dataset import *  # noqa
 from .pool_resilver import *  # noqa
 from .pool_scrub import *  # noqa
+from .pool_snapshot import *  # noqa
 from .pool_snapshot_count import *  # noqa
 from .pool_snapshottask import *  # noqa
 from .privilege import *  # noqa
 from .rdma import *  # noqa
 from .rdma_interface import *  # noqa
 from .replication import *  # noqa
+from .replication_config import *  # noqa
+from .replication_crud import *  # noqa
 from .reporting import *  # noqa
 from .reporting_exporters import *  # noqa
 from .rsync_task import *  # noqa
@@ -73,7 +78,9 @@ from .smartctl import *  # noqa
 from .smart_test import *  # noqa
 from .smb import *  # noqa
 from .snmp import *  # noqa
+from .ssh import *  # noqa
 from .static_route import *  # noqa
+from .system_general import *  # noqa
 from .system_general_keymap import *  # noqa
 from .system_general_ui import *  # noqa
 from .system_lifecycle import *  # noqa
@@ -93,5 +100,6 @@ from .virt_global import *  # noqa
 from .virt_instance import *  # noqa
 from .virt_volume import *  # noqa
 from .vmware import *  # noqa
+from .webui_crypto import *  # noqa
 from .webui_enclosure import *  # noqa
 from .webui_main_dashboard import *  # noqa

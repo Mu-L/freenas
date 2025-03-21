@@ -1,9 +1,8 @@
 from cryptography import x509
 
-from middlewared.schema import accepts, Ref, Str
-from middlewared.service import Service, ValidationErrors
+from truenas_crypto_utils.extensions import get_extension_params
 
-from .extensions_utils import get_extension_params
+from middlewared.service import Service, ValidationErrors
 
 
 class CryptoKeyService(Service):
@@ -11,18 +10,10 @@ class CryptoKeyService(Service):
     class Config:
         private = True
 
-    @accepts(
-        Ref('cert_extensions'),
-        Str('schema')
-    )
     def validate_extensions(self, extensions_data, schema):
-        # We do not need to validate some extensions like `AuthorityKeyIdentifier`.
-        # They are generated from the cert/ca's public key contents. So we skip these.
-
-        skip_extension = ['AuthorityKeyIdentifier']
         verrors = ValidationErrors()
 
-        for extension in filter(lambda v: v[1]['enabled'] and v[0] not in skip_extension, extensions_data.items()):
+        for extension in filter(lambda v: v[1]['enabled'], extensions_data.items()):
             klass = getattr(x509.extensions, extension[0])
             try:
                 klass(*get_extension_params(extension))
